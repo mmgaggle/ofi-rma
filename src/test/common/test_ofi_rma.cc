@@ -4,7 +4,9 @@
 #include "common/ofi_rma.h"
 
 #include <cerrno>
+#include <atomic>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -55,6 +57,8 @@ TEST(OfiToken, Rejects)
 
 namespace {
 
+constexpr std::chrono::milliseconds BUDGET{3000};
+
 struct pair_t {
   std::unique_ptr<Endpoint> target;
   std::unique_ptr<Endpoint> writer;
@@ -67,7 +71,6 @@ pair_t open_pair(const std::string& prov, const std::string& node)
   config_t c;
   c.provider = prov;
   c.node = node;
-  c.op_timeout = std::chrono::milliseconds(3000);
   config_t tc = c;
   tc.progress_thread = true;
   config_t wc = c;
@@ -111,7 +114,7 @@ TEST_P(OfiWrite, PlacesRanges)
   // two source buffers, written to the window with their halves swapped
   iovec iov[2] = {{src.data(), N / 3}, {src.data() + N / 3, N - N / 3}};
   std::vector<Endpoint::write_t> ws = {{0, N / 2, N / 2}, {N / 2, N / 2, 0}};
-  ASSERT_EQ(0, p.writer->write(*tok, iov, 2, ws)) << p.writer->last_error();
+  ASSERT_EQ(0, p.writer->write(*tok, iov, 2, ws, BUDGET)) << p.writer->last_error();
   p.target->sync();
   EXPECT_EQ(0, memcmp(win.data(), src.data() + N / 2, N / 2));
   EXPECT_EQ(0, memcmp(win.data() + N / 2, src.data(), N / 2));
@@ -120,34 +123,98 @@ TEST_P(OfiWrite, PlacesRanges)
   auto sub = parse_token(p.target->window_token(w, 4096, 8192));
   ASSERT_TRUE(sub);
   std::vector<Endpoint::write_t> one = {{0, 100, 8000}};
-  ASSERT_EQ(0, p.writer->write(*sub, iov, 1, one));
+  ASSERT_EQ(0, p.writer->write(*sub, iov, 1, one, BUDGET));
   p.target->sync();
   EXPECT_EQ(0, memcmp(win.data() + 4096 + 8000, src.data(), 100));
 
   // writes that leave the window or the source are refused up front
   std::vector<Endpoint::write_t> past_window = {{0, 100, 8100}};
-  EXPECT_EQ(-ERANGE, p.writer->write(*sub, iov, 1, past_window));
+  EXPECT_EQ(-ERANGE, p.writer->write(*sub, iov, 1, past_window, BUDGET));
   std::vector<Endpoint::write_t> past_source = {{N / 3 - 10, 20, 0}};
-  EXPECT_EQ(-ERANGE, p.writer->write(*tok, iov, 1, past_source));
+  EXPECT_EQ(-ERANGE, p.writer->write(*tok, iov, 1, past_source, BUDGET));
 
   // another provider's token is not ours to serve
   auto other = *tok;
   other.provider = "nosuchprov";
-  EXPECT_EQ(-EPROTONOSUPPORT, p.writer->write(other, iov, 1, one));
+  EXPECT_EQ(-EPROTONOSUPPORT, p.writer->write(other, iov, 1, one, BUDGET));
 
   // a source larger than a staging buffer is refused
   std::vector<char> big(5 << 20);
   iovec bigv = {big.data(), big.size()};
   std::vector<Endpoint::write_t> bw = {{0, 10, 0}};
-  EXPECT_EQ(-E2BIG, p.writer->write(*tok, &bigv, 1, bw));
+  EXPECT_EQ(-E2BIG, p.writer->write(*tok, &bigv, 1, bw, BUDGET));
 
   // an endpoint that only lends windows cannot write
-  EXPECT_EQ(-EOPNOTSUPP, p.target->write(*tok, iov, 1, one));
+  EXPECT_EQ(-EOPNOTSUPP, p.target->write(*tok, iov, 1, one, BUDGET));
 
   const auto s = p.writer->stats();
   EXPECT_EQ(s.writes_failed, 0u);
   EXPECT_EQ(s.peers_inserted, 1u);
   EXPECT_EQ(s.bytes_written, N + N / 3);
+}
+
+TEST(OfiWriteCutOff, Tcp)
+{
+  // a window owner that never polls: over tcp, a write into it cannot
+  // complete, so the writer must cut it off at its budget and still be
+  // usable afterwards
+  config_t c;
+  c.provider = "tcp";
+  c.node = "127.0.0.1";
+  std::string err;
+  auto stalled = Endpoint::open(c, &err);
+  config_t tc = c;
+  tc.progress_thread = true;
+  auto healthy = Endpoint::open(tc, &err);
+  config_t wc = c;
+  wc.stage_size = 8 << 20;
+  wc.stage_count = 2;
+  auto writer = Endpoint::open(wc, &err);
+  if (!stalled || !healthy || !writer) {
+    GTEST_SKIP() << "tcp: " << err;
+  }
+  const size_t N = 8 << 20;
+  std::vector<char> w1(N), w2(N), src(N, 'x');
+  Endpoint::window_t a, b;
+  ASSERT_EQ(0, stalled->register_window(w1.data(), N, &a));
+  ASSERT_EQ(0, healthy->register_window(w2.data(), N, &b));
+  auto ta = parse_token(stalled->window_token(a, 0, N));
+  auto tb = parse_token(healthy->window_token(b, 0, N));
+  ASSERT_TRUE(ta && tb);
+  iovec iov{src.data(), N};
+  std::vector<Endpoint::write_t> all = {{0, N, 0}};
+
+  // connect: the stalled owner polls only while this warm-up runs
+  {
+    std::atomic<bool> stop{false};
+    std::thread poller([&] { while (!stop) stalled->progress(); });
+    std::vector<char> z(4096, 0);
+    iovec zv{z.data(), z.size()};
+    std::vector<Endpoint::write_t> one = {{0, z.size(), 0}};
+    EXPECT_EQ(0, writer->write(*ta, &zv, 1, one, BUDGET));
+    stop = true;
+    poller.join();
+  }
+
+  const auto t0 = std::chrono::steady_clock::now();
+  EXPECT_EQ(-ETIMEDOUT, writer->write(*ta, &iov, 1, all,
+				      std::chrono::milliseconds(1000)));
+  const auto took = std::chrono::steady_clock::now() - t0;
+  // it gave up within its budget, cut-off included
+  EXPECT_LT(took, std::chrono::milliseconds(1000));
+  EXPECT_EQ(1u, writer->stats().resets);
+  EXPECT_EQ(1u, writer->stats().timeouts);
+
+  // a budget smaller than a cut-off costs is refused before anything
+  // is sent
+  EXPECT_EQ(-ETIMEDOUT, writer->write(*tb, &iov, 1, all,
+				      std::chrono::milliseconds(1)));
+
+  // the reopened endpoint writes again
+  ASSERT_EQ(0, writer->write(*tb, &iov, 1, all, BUDGET))
+    << writer->last_error();
+  healthy->sync();
+  EXPECT_EQ(0, memcmp(w2.data(), src.data(), N));
 }
 
 INSTANTIATE_TEST_SUITE_P(

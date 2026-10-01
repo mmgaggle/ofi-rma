@@ -223,7 +223,21 @@ struct Endpoint::Impl {
   std::atomic<uint64_t> staging_busy{0};
   std::atomic<uint64_t> timeouts{0};
 
+  /// set when a cut-off could not reopen the endpoint; every write
+  /// fails from then on
+  bool broken = false;
+  std::atomic<uint64_t> resets{0};
+  /// how long a cut-off takes, at most, as measured; a write stops
+  /// waiting this much before its budget runs out
+  std::chrono::milliseconds reset_cost{100};
+
   ~Impl();
+  /// open the completion queue and the endpoint, bind and enable them,
+  /// and read the endpoint's name
+  int open_ep(std::string* err);
+  /// cut off every write in flight by closing and reopening the
+  /// endpoint; plans still waiting fail with -ECANCELED
+  void reset_locked();
   /// register memory; a region others write into needs a key, a local
   /// write source only a descriptor
   int reg(char* ptr, size_t len, uint64_t access, region_t* out);
@@ -313,6 +327,9 @@ void Endpoint::Impl::complete_locked(op_t* op, int err)
 
 void Endpoint::Impl::poll_locked()
 {
+  if (!cq) {
+    return;
+  }
   fi_cq_entry ent[16];
   for (int round = 0; round < 8; round++) {
     const ssize_t n = fi_cq_read(cq, ent, 16);
@@ -374,6 +391,112 @@ int Endpoint::Impl::peer_locked(const std::string& name, fi_addr_t* out)
   peers_inserted++;
   *out = p.addr;
   return 0;
+}
+
+int Endpoint::Impl::open_ep(std::string* err)
+{
+  fi_cq_attr cq_attr{};
+  cq_attr.format = FI_CQ_FORMAT_CONTEXT;
+  cq_attr.size = 4096;
+  cq_attr.wait_obj = FI_WAIT_NONE;
+  int r;
+  if ((r = fi_cq_open(domain, &cq_attr, &cq, nullptr))) {
+    cq = nullptr;
+    *err = "fi_cq_open: " + fi_err(r);
+    return to_errno(r);
+  }
+  if ((r = fi_endpoint(domain, info, &ep, nullptr))) {
+    ep = nullptr;
+    *err = "fi_endpoint: " + fi_err(r);
+    return to_errno(r);
+  }
+  if ((r = fi_ep_bind(ep, &av->fid, 0)) ||
+      (r = fi_ep_bind(ep, &cq->fid, FI_TRANSMIT | FI_RECV)) ||
+      (r = fi_enable(ep))) {
+    *err = "enabling the endpoint: " + fi_err(r);
+    return to_errno(r);
+  }
+  size_t len = 0;
+  r = fi_getname(&ep->fid, nullptr, &len);
+  if (r != -FI_ETOOSMALL || len == 0 || len > MAX_NAME) {
+    *err = "fi_getname: " + (r ? fi_err(r) : std::string("bad length"));
+    return -EINVAL;
+  }
+  my_name.resize(len);
+  if ((r = fi_getname(&ep->fid, my_name.data(), &len))) {
+    *err = "fi_getname: " + fi_err(r);
+    return to_errno(r);
+  }
+  my_name.resize(len);
+  return 0;
+}
+
+void Endpoint::Impl::reset_locked()
+{
+  const auto t0 = std::chrono::steady_clock::now();
+  resets++;
+  // Cut off: closing the endpoint cancels every operation it still has
+  // outstanding, so none of them retries into a peer's window later.
+  // The completion queue goes too, with any completions of those
+  // operations, whose contexts are about to be released.
+  if (ep) {
+    fi_close(&ep->fid);
+    ep = nullptr;
+  }
+  if (cq) {
+    fi_close(&cq->fid);
+    cq = nullptr;
+  }
+  // every plan still waiting has lost its writes
+  for (auto it = plans.begin(); it != plans.end(); ) {
+    plan_t* p = (it++)->get();
+    p->outstanding = 0;
+    if (!p->err) {
+      p->err = -ECANCELED;
+    }
+    if (p->abandoned) {
+      retire_locked(p);
+    }
+  }
+  // regions bound to the old endpoint are gone with it
+  const bool rebind = mr_mode & FI_MR_ENDPOINT;
+  if (rebind) {
+    for (auto& [id, w] : windows) {
+      fi_close(&w.mr->fid);
+      w.mr = nullptr;
+    }
+    if (stage_mr.mr) {
+      fi_close(&stage_mr.mr->fid);
+      stage_mr.mr = nullptr;
+    }
+  }
+  std::string err;
+  if (open_ep(&err) < 0) {
+    broken = true;
+    last_err = "reopening after a cut-off: " + err;
+    return;
+  }
+  if (rebind) {
+    for (auto& [id, w] : windows) {
+      region_t fresh;
+      if (reg(w.ptr, w.len, FI_REMOTE_WRITE, &fresh) < 0) {
+        broken = true;
+        return;
+      }
+      w = fresh;
+    }
+    if (stage) {
+      region_t fresh;
+      if (reg(stage, cfg.stage_size * cfg.stage_count, FI_WRITE, &fresh) < 0) {
+        broken = true;
+        return;
+      }
+      stage_mr = fresh;
+    }
+  }
+  const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - t0);
+  reset_cost = std::max(reset_cost, took + std::chrono::milliseconds(50));
 }
 
 Endpoint::Endpoint(std::unique_ptr<Impl> i) : impl(std::move(i)) {}
@@ -449,36 +572,9 @@ std::unique_ptr<Endpoint> Endpoint::open(const config_t& cfg, std::string* err)
     *err = "fi_av_open: " + fi_err(r);
     return nullptr;
   }
-  fi_cq_attr cq_attr{};
-  cq_attr.format = FI_CQ_FORMAT_CONTEXT;
-  cq_attr.size = 4096;
-  cq_attr.wait_obj = FI_WAIT_NONE;
-  if ((r = fi_cq_open(d->domain, &cq_attr, &d->cq, nullptr))) {
-    *err = "fi_cq_open: " + fi_err(r);
+  if (d->open_ep(err) < 0) {
     return nullptr;
   }
-  if ((r = fi_endpoint(d->domain, info, &d->ep, nullptr))) {
-    *err = "fi_endpoint: " + fi_err(r);
-    return nullptr;
-  }
-  if ((r = fi_ep_bind(d->ep, &d->av->fid, 0)) ||
-      (r = fi_ep_bind(d->ep, &d->cq->fid, FI_TRANSMIT | FI_RECV)) ||
-      (r = fi_enable(d->ep))) {
-    *err = "enabling the endpoint: " + fi_err(r);
-    return nullptr;
-  }
-  size_t len = 0;
-  r = fi_getname(&d->ep->fid, nullptr, &len);
-  if (r != -FI_ETOOSMALL || len == 0 || len > MAX_NAME) {
-    *err = "fi_getname: " + (r ? fi_err(r) : std::string("bad length"));
-    return nullptr;
-  }
-  d->my_name.resize(len);
-  if ((r = fi_getname(&d->ep->fid, d->my_name.data(), &len))) {
-    *err = "fi_getname: " + fi_err(r);
-    return nullptr;
-  }
-  d->my_name.resize(len);
 
   if (cfg.stage_size && cfg.stage_count) {
     const size_t total = cfg.stage_size * cfg.stage_count;
@@ -587,7 +683,8 @@ std::string Endpoint::window_token(const window_t& w, uint64_t ofs,
 }
 
 int Endpoint::write(const token_t& dst, const struct iovec* iov,
-		    size_t iovcnt, const std::vector<write_t>& writes)
+		    size_t iovcnt, const std::vector<write_t>& writes,
+		    std::chrono::milliseconds budget)
 {
   auto& d = *impl;
   if (!d.stage) {
@@ -611,9 +708,16 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
   if (total > d.cfg.stage_size) {
     return -E2BIG;
   }
-  const auto deadline = std::chrono::steady_clock::now() + d.cfg.op_timeout;
-
   std::unique_lock l(d.mtx);
+  if (d.broken || !d.ep) {
+    return -EIO;
+  }
+  // stop waiting early enough to cut the writes off within the budget
+  if (budget <= d.reset_cost) {
+    return -ETIMEDOUT;
+  }
+  const auto deadline = std::chrono::steady_clock::now() + budget -
+    d.reset_cost;
   size_t slot = 0;
   while (slot < d.stage_busy.size() && d.stage_busy[slot]) {
     slot++;
@@ -686,10 +790,12 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
       return res;
     }
     if (std::chrono::steady_clock::now() > deadline) {
-      // the staging buffer stays claimed until the writes still in
-      // flight complete; whoever polls then retires the plan
-      plan->abandoned = true;
+      // out of budget with writes in flight: cut them off, so none of
+      // them lands in the peer's window after the caller gave up
       d.timeouts++;
+      d.last_err = "writes still in flight at the deadline; cut off";
+      d.reset_locked();
+      d.retire_locked(plan);
       return -ETIMEDOUT;
     }
     l.unlock();
@@ -721,6 +827,7 @@ Endpoint::stats_t Endpoint::stats() const
   s.peers_inserted = d.peers_inserted;
   s.staging_busy = d.staging_busy;
   s.timeouts = d.timeouts;
+  s.resets = d.resets;
   std::lock_guard l(d.mtx);
   s.windows = d.windows.size();
   return s;

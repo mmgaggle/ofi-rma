@@ -65,8 +65,6 @@ struct config_t {
   /// bytes each; 0 for an endpoint that only lends windows
   size_t stage_size = 0;
   size_t stage_count = 0;
-  /// how long write() waits for its completions
-  std::chrono::milliseconds op_timeout{5000};
   /// poll the completion queue from a thread of our own. Providers that
   /// progress manually place incoming writes only while polled, so an
   /// endpoint that lends windows needs this unless the application
@@ -112,14 +110,26 @@ public:
   };
   /**
    * Gather iov into a staging buffer and write each range into the
-   * window dst names. Blocks until every write completed. Returns 0 or
-   * a negative errno: -EPROTONOSUPPORT for another provider's token,
-   * -EBUSY when no staging buffer is free, -E2BIG when the source does
-   * not fit one, -ETIMEDOUT past op_timeout. After a failure the window
-   * may hold some of the bytes.
+   * window dst names. Blocks until every write completed, or until the
+   * budget runs out. Returns 0 or a negative errno: -EPROTONOSUPPORT
+   * for another provider's token, -EBUSY when no staging buffer is
+   * free, -E2BIG when the source does not fit one, -ETIMEDOUT when the
+   * budget ran out, -ECANCELED when another write's cut-off took this
+   * one's writes with it. After a failure the window may hold some of
+   * the bytes.
+   *
+   * The budget bounds when the writes may still land. A write that is
+   * still in flight when it runs out is cut off: the endpoint closes
+   * and reopens itself, which cancels every operation it has
+   * outstanding, so no retransmission reaches the peer later. The
+   * cut-off fails every other write in flight on the endpoint too. The
+   * endpoint stops waiting early by the measured cost of a cut-off.
+   * Windows stay registered across a cut-off, but the endpoint's name
+   * can change with it, so a token issued before it can stop working.
    */
   int write(const token_t& dst, const struct iovec* iov, size_t iovcnt,
-	    const std::vector<write_t>& writes);
+	    const std::vector<write_t>& writes,
+	    std::chrono::milliseconds budget);
 
   /// one pass over the completion queue
   void progress();
@@ -134,6 +144,7 @@ public:
     uint64_t peers_inserted = 0;
     uint64_t staging_busy = 0;
     uint64_t timeouts = 0;
+    uint64_t resets = 0;  ///< cut-offs: endpoint closed and reopened
     uint64_t windows = 0;
   };
   stats_t stats() const;
