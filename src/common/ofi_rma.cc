@@ -51,6 +51,13 @@ constexpr std::chrono::microseconds WAIT_SLEEP{50};
 constexpr std::chrono::microseconds POLL_BUSY_MARGIN{2};
 /// registrations a window may go through for a key out of quarantine
 constexpr int REKEY_ATTEMPTS = 8;
+/// Options of the UET libfabric provider, at FI_OPT_ENDPOINT, read with
+/// fi_getopt() into a bool (FI_PROV_SPECIFIC, 1 << 31, plus a code; see
+/// its prov/uet_fi.h): whether closing the endpoint discards the writes it
+/// has outstanding, and whether fi_cancel() discards one. Other providers
+/// do not know them.
+constexpr int OPT_CLOSE_DISCARDS = static_cast<int>((1U << 31) | 0x5545U);
+constexpr int OPT_CANCEL_DISCARDS = static_cast<int>((1U << 31) | 0x5543U);
 /// the least time a write must have left to post; see write()
 constexpr std::chrono::milliseconds POST_MARGIN{1};
 /// plans this large or larger teach the endpoint how fast plans move;
@@ -274,6 +281,7 @@ struct Endpoint::Impl {
   struct op_t {
     fi_context2 ctx;
     plan_t* plan = nullptr;
+    bool done = false;  ///< its completion arrived
   };
   struct plan_t {
     std::vector<op_t> ops;  ///< reserved up front, never reallocated
@@ -285,9 +293,23 @@ struct Endpoint::Impl {
     std::chrono::steady_clock::time_point posted_at{};
     size_t slot = 0;
     std::string peer;
+    /// its writer cancelled it and left; it is retired when the last of
+    /// its cancelled operations completes, or when the endpoint closes
+    bool abandoned = false;
     std::list<std::unique_ptr<plan_t>>::iterator self;
   };
   std::list<std::unique_ptr<plan_t>> plans;
+  /// plans a test's cancel_hook cancelled: the provider still holds their
+  /// operations, and reads their staging, until the endpoint closes
+  std::list<std::unique_ptr<plan_t>> hook_cancelled;
+  /// fi_cancel() discards a write (OPT_CANCEL_DISCARDS); probed whenever
+  /// the endpoint opens
+  std::atomic<bool> cancel_discards{false};
+  /// closing the endpoint discards its writes (OPT_CLOSE_DISCARDS): 1 yes,
+  /// 0 no, -1 the provider does not say
+  std::atomic<int> close_discards{-1};
+  std::atomic<uint64_t> plans_cut_off{0};
+  std::atomic<uint64_t> cancels_failed{0};
   /// Waiting writes. One of them, the poller, polls the completion queue
   /// for all; the others sleep on done_cv until a plan finishes, the
   /// poller leaves, or a cut-off fails them.
@@ -360,6 +382,14 @@ struct Endpoint::Impl {
   /// a cut-off went wrong: fail every waiting plan with -ENOTRECOVERABLE
   /// and take no more writes
   void make_unsafe_locked(std::string why);
+  /// close the endpoint and its completion queue, and free what only the
+  /// endpoint still held; on failure the endpoint stays open, a zombie
+  /// nothing calls into again
+  int close_ep_locked();
+  /// cancel the operations of a plan that have not completed; *simulated
+  /// when a test's cancel_hook stood for the provider. 0, or the
+  /// libfabric error of the first cancel that failed.
+  int cancel_plan_locked(plan_t* p, bool* simulated);
   /// register memory; a region others write into needs a key, a local
   /// write source only a descriptor
   int reg(char* ptr, size_t len, uint64_t access, region_t* out);
@@ -516,9 +546,10 @@ void Endpoint::Impl::retire_locked(plan_t* p)
 void Endpoint::Impl::complete_locked(op_t* op, int err)
 {
   plan_t* p = op->plan;
-  if (!p || p->outstanding == 0) {
+  if (!p || p->outstanding == 0 || op->done) {
     return;
   }
+  op->done = true;
   p->outstanding--;
   if (err) {
     writes_failed++;
@@ -527,6 +558,10 @@ void Endpoint::Impl::complete_locked(op_t* op, int err)
     }
   }
   if (p->outstanding == 0) {
+    if (p->abandoned) {
+      retire_locked(p);  // its writer left; nobody waits for it
+      return;
+    }
     done_cv.notify_all();
   }
 }
@@ -767,6 +802,13 @@ void Endpoint::Impl::insert_peer(const std::string& name)
     l.lock();
     quiesce = true;
     while (!plans.empty() && !stopping) {
+      // reap completions: the writers may all be waiting for the endpoint
+      // now, and a plan whose writer left after cancelling it waits for
+      // its cancellations to complete
+      poll_locked();
+      if (plans.empty()) {
+	break;
+      }
       l.unlock();
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
       l.lock();
@@ -900,6 +942,82 @@ int Endpoint::Impl::open_ep(std::string* err)
     return to_errno(r);
   }
   my_name.resize(len);
+  // what the provider promises about discarding writes
+  auto getopt_bool = [this](int opt) {
+    bool b = false;
+    size_t blen = sizeof(b);
+    if (fi_getopt(&ep->fid, FI_OPT_ENDPOINT, opt, &b, &blen) ||
+	blen != sizeof(b)) {
+      return -1;
+    }
+    return b ? 1 : 0;
+  };
+  close_discards = getopt_bool(OPT_CLOSE_DISCARDS);
+  cancel_discards = cfg.per_plan_cutoff &&
+    (cfg.cancel_hook || getopt_bool(OPT_CANCEL_DISCARDS) == 1);
+  return 0;
+}
+
+int Endpoint::Impl::cancel_plan_locked(plan_t* p, bool* simulated)
+{
+  *simulated = false;
+  for (auto& op : p->ops) {
+    if (op.done) {
+      continue;
+    }
+    int r;
+    if (cfg.cancel_hook) {
+      r = cfg.cancel_hook();
+      *simulated = true;
+    } else {
+      r = fi_cancel(&ep->fid, &op.ctx);
+      if (r == -FI_ENOENT) {
+	r = 0;  // no longer outstanding: its completion is on its way
+      }
+    }
+    if (r) {
+      return r;
+    }
+  }
+  return 0;
+}
+
+int Endpoint::Impl::close_ep_locked()
+{
+  if (ep) {
+    int r = cfg.cutoff_close_hook ? cfg.cutoff_close_hook() : 0;
+    if (r == 0) {
+      r = fi_close(&ep->fid);
+    }
+    if (r) {
+      zombie = true;
+      return r;
+    }
+    ep = nullptr;
+  }
+  if (cq) {
+    if (int r = fi_close(&cq->fid); r) {
+      // the endpoint is closed, so its writes are cut off; the queue
+      // only stays allocated
+      set_err("closing the completion queue in a cut-off: " + fi_err(r));
+    }
+    cq = nullptr;
+    cq_fd = -1;
+  }
+  // nothing references the operations of plans whose writers left any
+  // more, nor the staging they read
+  for (auto it = plans.begin(); it != plans.end(); ) {
+    plan_t* p = (it++)->get();
+    if (p->abandoned) {
+      p->outstanding = 0;
+      retire_locked(p);
+    }
+  }
+  for (auto& p : hook_cancelled) {
+    stage_busy[p->slot] = false;
+    put_peer(p->peer);
+  }
+  hook_cancelled.clear();
   return 0;
 }
 
@@ -925,30 +1043,13 @@ void Endpoint::Impl::reset_locked()
   // outstanding, so none of them retries into a peer's window later.
   // The completion queue goes too, with any completions of those
   // operations, whose contexts are about to be released.
-  if (ep) {
-    int r = cfg.cutoff_close_hook ? cfg.cutoff_close_hook() : 0;
-    if (r == 0) {
-      r = fi_close(&ep->fid);
-    }
-    if (r) {
-      // the endpoint is still open, and so are its writes: they were not
-      // cut off and can land at any time
-      cutoffs_failed++;
-      zombie = true;
-      make_unsafe_locked("a cut-off failed: closing the endpoint: " +
-			 fi_err(r) + "; its writes may still land");
-      return;
-    }
-    ep = nullptr;
-  }
-  if (cq) {
-    if (int r = fi_close(&cq->fid); r) {
-      // the endpoint is closed, so its writes are cut off; the queue
-      // only stays allocated
-      set_err("closing the completion queue in a cut-off: " + fi_err(r));
-    }
-    cq = nullptr;
-    cq_fd = -1;
+  if (int r = close_ep_locked(); r) {
+    // the endpoint is still open, and so are its writes: they were not
+    // cut off and can land at any time
+    cutoffs_failed++;
+    make_unsafe_locked("a cut-off failed: closing the endpoint: " +
+		       fi_err(r) + "; its writes may still land");
+    return;
   }
   // Every plan with writes in flight has lost them, and its writer has
   // to hear it. One with none in flight has lost nothing: it is done, or
@@ -1207,6 +1308,11 @@ std::string Endpoint::describe() const
   if (impl->stage) {
     s += impl->thread_safe ? ", concurrent peer inserts" :
       ", peer inserts pause writes";
+    s += impl->cancel_discards ? ", late writes cancelled one by one" :
+      ", late writes cut off by reopening the endpoint";
+    if (impl->close_discards == 0) {
+      s += ", closing does not discard writes";
+    }
   }
   return s;
 }
@@ -1483,7 +1589,57 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
       // them lands in the peer's window after the caller gave up
       leave();
       d.timeouts++;
-      d.set_err("writes still in flight at the deadline; cut off");
+      if (d.cancel_discards) {
+	// only this write's operations, if the provider discards them
+	const auto t0 = std::chrono::steady_clock::now();
+	bool simulated = false;
+	const int r = d.cancel_plan_locked(plan, &simulated);
+	const auto cut = std::chrono::steady_clock::now();
+	if (r == 0) {
+	  d.plans_cut_off++;
+	  if (simulated) {
+	    // the provider still holds the operations: keep them, and the
+	    // staging they read, until the endpoint closes
+	    plan->outstanding = 0;
+	    d.hook_cancelled.push_back(std::move(*plan->self));
+	    d.plans.erase(plan->self);
+	  }
+	  if (cut > plan->budget_end) {
+	    d.cutoffs_late++;
+	    d.make_unsafe_locked(
+	      "cancelling a late write took " + std::to_string(
+		std::chrono::duration_cast<std::chrono::milliseconds>(
+		  cut - t0).count()) +
+	      " ms and ended after its budget; writes may have landed late");
+	    // stop the others too; on failure the endpoint stays a zombie
+	    if (!simulated && d.close_ep_locked() == 0) {
+	      d.retire_locked(plan);
+	    }
+	    return -ENOTRECOVERABLE;
+	  }
+	  d.note_cutoff_cost(cut - t0);
+	  d.set_err("writes still in flight at the deadline; cancelled");
+	  if (simulated) {
+	    return -ETIMEDOUT;
+	  }
+	  // the cancellations complete with FI_ECANCELED, usually at once;
+	  // whoever polls next retires the plan otherwise
+	  d.poll_locked();
+	  if (plan->outstanding == 0) {
+	    d.retire_locked(plan);
+	  } else {
+	    plan->abandoned = true;
+	  }
+	  return -ETIMEDOUT;
+	}
+	// the provider kept the operations: close the endpoint instead,
+	// which discards them all
+	d.cancels_failed++;
+	d.set_err("cancelling a late write failed: " + fi_err(r) +
+		  "; cutting it off by closing the endpoint");
+      } else {
+	d.set_err("writes still in flight at the deadline; cut off");
+      }
       d.reset_locked();
       // a cut-off that went wrong is not a clean one
       const int res = plan->err == -ENOTRECOVERABLE ? -ENOTRECOVERABLE :
@@ -1548,6 +1704,10 @@ Endpoint::stats_t Endpoint::stats() const
   s.budget_refused = d.budget_refused;
   s.cutoff_cost_ms = d.cutoff_cost_ms;
   s.late_starts = d.late_starts;
+  s.plans_cut_off = d.plans_cut_off;
+  s.cancels_failed = d.cancels_failed;
+  s.cancel_discards = d.cancel_discards;
+  s.close_discards = d.close_discards;
   s.windows_rekeyed = d.windows_rekeyed;
   s.key_collisions = d.key_collisions;
   s.unsafe = d.unsafe;

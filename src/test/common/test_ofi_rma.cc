@@ -670,7 +670,8 @@ struct stalled_t {
   static constexpr size_t S = 4 << 20;
   std::vector<char> src = std::vector<char>(S, 'k');
 
-  bool open(std::function<int()> hook) {
+  bool open(std::function<int()> hook,
+	    std::function<void(config_t&)> tweak = nullptr) {
     s.ep = open_target("tcp", "127.0.0.1", false);
     config_t c;
     c.provider = "tcp";
@@ -678,6 +679,9 @@ struct stalled_t {
     c.stage_size = S;
     c.stage_count = 4;
     c.cutoff_close_hook = std::move(hook);
+    if (tweak) {
+      tweak(c);
+    }
     std::string err;
     writer = Endpoint::open(c, &err);
     if (!s.ep || !writer || !lend(s, 4 * S)) {
@@ -706,6 +710,181 @@ struct stalled_t {
 };
 
 } // anonymous namespace
+
+namespace {
+
+/// A late write into a stalled owner (slot 0, 600 ms) next to a long one
+/// (slot 1, 3 s), with writes to a healthy owner going on throughout.
+struct neighbors_t {
+  int r_late = 1, r_long = 1;
+  clk::duration took_late{}, took_long{};
+  int healthy_ok = 0, healthy_failed = 0;
+  int healthy_first_rc = 0;
+
+  void run(stalled_t& t, window_owner_t& h) {
+    std::atomic<bool> stop{false};
+    std::thread healthy([&] {
+      iovec iov{t.src.data(), 64 << 10};
+      std::vector<Endpoint::write_t> one = {{0, 64 << 10, 0}};
+      while (!stop) {
+	const int r = t.writer->write(h.tok, &iov, 1, one, BUDGET);
+	if (r == 0) {
+	  healthy_ok++;
+	} else {
+	  if (!healthy_failed++) {
+	    healthy_first_rc = r;
+	  }
+	}
+	std::this_thread::sleep_for(ms(5));
+      }
+    });
+    std::thread long_one([&] {
+      const auto a = clk::now();
+      r_long = t.write(1, ms(3000));
+      took_long = clk::now() - a;
+    });
+    std::this_thread::sleep_for(ms(20));
+    const auto a = clk::now();
+    r_late = t.write(0, ms(600));
+    took_late = clk::now() - a;
+    long_one.join();
+    stop = true;
+    healthy.join();
+  }
+};
+
+} // anonymous namespace
+
+TEST(OfiPerPlanCutOff, OthersKeepGoing)
+{
+  // A provider that discards a cancelled write: a late write is cut off
+  // alone. The long write next to it runs to its own deadline, writes to
+  // a healthy owner never fail, and the endpoint is never reset.
+  stalled_t t;
+  if (!t.open(nullptr, [](config_t& c) {
+	c.stage_count = 8;
+	c.cancel_hook = [] { return 0; };
+      })) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  EXPECT_TRUE(t.writer->stats().cancel_discards);
+  EXPECT_NE(std::string::npos,
+	    t.writer->describe().find("late writes cancelled one by one"));
+  window_owner_t h;
+  h.ep = open_target("tcp", "127.0.0.1");
+  ASSERT_TRUE(h.ep && lend(h, 64 << 10));
+  neighbors_t n;
+  n.run(t, h);
+  EXPECT_EQ(-ETIMEDOUT, n.r_late);
+  EXPECT_LT(n.took_late, ms(600));
+  EXPECT_EQ(-ETIMEDOUT, n.r_long);   // its own deadline, not cancelled
+  EXPECT_GT(n.took_long, ms(2500));
+  EXPECT_EQ(0, n.healthy_failed) << n.healthy_first_rc;
+  EXPECT_GT(n.healthy_ok, 20);
+  const auto st = t.writer->stats();
+  EXPECT_EQ(2u, st.plans_cut_off);
+  EXPECT_EQ(0u, st.resets);
+  EXPECT_FALSE(st.unsafe);
+}
+
+TEST(OfiPerPlanCutOff, WithoutDiscardTheEndpointResets)
+{
+  // the same, where cancelling would not discard: the late write's
+  // cut-off resets the endpoint, which takes the long write with it
+  stalled_t t;
+  if (!t.open(nullptr, [](config_t& c) { c.stage_count = 8; })) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  EXPECT_FALSE(t.writer->stats().cancel_discards);
+  EXPECT_NE(std::string::npos,
+	    t.writer->describe().find("cut off by reopening the endpoint"));
+  window_owner_t h;
+  h.ep = open_target("tcp", "127.0.0.1");
+  ASSERT_TRUE(h.ep && lend(h, 64 << 10));
+  neighbors_t n;
+  n.run(t, h);
+  EXPECT_EQ(-ETIMEDOUT, n.r_late);
+  EXPECT_EQ(-ECANCELED, n.r_long);
+  EXPECT_LT(n.took_long, ms(1500));
+  const auto st = t.writer->stats();
+  EXPECT_EQ(0u, st.plans_cut_off);
+  EXPECT_EQ(1u, st.resets);
+}
+
+TEST(OfiPerPlanCutOff, FailedCancelResets)
+{
+  // a cancel that fails falls back to closing the endpoint, which
+  // discards every write
+  stalled_t t;
+  if (!t.open(nullptr, [](config_t& c) {
+	c.stage_count = 8;
+	c.cancel_hook = [] { return -EIO; };
+      })) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  window_owner_t h;
+  h.ep = open_target("tcp", "127.0.0.1");
+  ASSERT_TRUE(h.ep && lend(h, 64 << 10));
+  neighbors_t n;
+  n.run(t, h);
+  EXPECT_EQ(-ETIMEDOUT, n.r_late);
+  EXPECT_EQ(-ECANCELED, n.r_long);
+  const auto st = t.writer->stats();
+  EXPECT_EQ(1u, st.cancels_failed);
+  EXPECT_EQ(1u, st.resets);
+  EXPECT_EQ(0u, st.plans_cut_off);
+  EXPECT_FALSE(st.unsafe);
+}
+
+TEST(OfiPerPlanCutOff, FailedCancelAndCloseIsUnsafe)
+{
+  // neither the cancel nor the close discards: the writes may still land
+  stalled_t t;
+  if (!t.open([] { return -EBUSY; }, [](config_t& c) {
+	c.cancel_hook = [] { return -EIO; };
+      })) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  EXPECT_EQ(-ENOTRECOVERABLE, t.write(0, ms(600)));
+  const auto st = t.writer->stats();
+  EXPECT_EQ(1u, st.cancels_failed);
+  EXPECT_EQ(1u, st.cutoffs_failed);
+  EXPECT_TRUE(st.unsafe);
+}
+
+TEST(OfiPerPlanCutOff, LateCancelIsUnsafe)
+{
+  // a cancel that returns after the write's budget ended may have let
+  // bytes land late
+  stalled_t t;
+  if (!t.open(nullptr, [](config_t& c) {
+	c.cancel_hook = [] { std::this_thread::sleep_for(ms(400)); return 0; };
+      })) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  EXPECT_EQ(-ENOTRECOVERABLE, t.write(0, ms(600)));
+  const auto st = t.writer->stats();
+  EXPECT_EQ(1u, st.cutoffs_late);
+  EXPECT_TRUE(st.unsafe);
+  EXPECT_EQ(-EIO, t.write(1, ms(2000)));
+}
+
+TEST(OfiPerPlanCutOff, ProvidersThatDoNotSay)
+{
+  // tcp and shm know neither option: they reset, and do not claim that
+  // closing discards
+  for (const char* prov : {"tcp", "shm"}) {
+    auto gate = std::make_shared<gate_t>();
+    auto w = open_writer(prov, std::string(prov) == "tcp" ? "127.0.0.1" : "",
+			 true, 4096, 1, gate);
+    if (!w) {
+      continue;
+    }
+    const auto st = w->stats();
+    EXPECT_FALSE(st.cancel_discards) << prov;
+    EXPECT_EQ(-1, st.close_discards) << prov;
+  }
+}
 
 TEST(OfiCutOffFails, Tcp)
 {

@@ -113,6 +113,22 @@ struct config_t {
   /// for tests: runs in write() after the source is gathered, without
   /// the endpoint's lock, just before the last look at the time left
   std::function<void()> pre_post_hook;
+  /// Cut off a late write by cancelling only its own operations, and keep
+  /// the endpoint and every other write in flight, when the provider
+  /// promises that fi_cancel() discards an outstanding write: no packet
+  /// of it is sent once the call returns, and it completes with
+  /// FI_ECANCELED. The UET provider says so through an endpoint option
+  /// (see cancel_discards in stats_t). Otherwise, or with this false, a
+  /// cut-off closes and reopens the endpoint, which fails every write in
+  /// flight on it.
+  bool per_plan_cutoff = true;
+  /// for tests: stands in for fi_cancel() of each outstanding operation
+  /// of a late write, as a provider that discards would, and makes the
+  /// endpoint cut off late writes one by one. Return 0 for discarded, or
+  /// a negative errno for a cancel that failed. The provider itself keeps
+  /// the operations, and the staging they read, until the endpoint
+  /// closes.
+  std::function<int()> cancel_hook;
   /// for tests: runs in a cut-off just before the endpoint is closed. A
   /// nonzero return stands for fi_close() failing with it, and the
   /// endpoint stays open.
@@ -182,10 +198,14 @@ public:
    * gave up. The endpoint is then unsafe() and takes no more writes.
    *
    * The budget bounds when the writes may still land. A write that is
-   * still in flight when it runs out is cut off: the endpoint closes
-   * and reopens itself, which cancels every operation it has
-   * outstanding, so no retransmission reaches the peer later. The
-   * cut-off fails every other write in flight on the endpoint too. The
+   * still in flight when it runs out is cut off. When the provider
+   * promises that cancelling a write discards it, only that write's
+   * operations are cancelled, and every other write goes on (see
+   * config_t::per_plan_cutoff). Otherwise the endpoint closes and
+   * reopens itself, which cancels every operation it has outstanding,
+   * so no retransmission reaches the peer later; that cut-off fails
+   * every other write in flight on the endpoint too. A cancel that fails
+   * falls back to closing the endpoint. The
    * endpoint stops waiting early by the measured cost of a cut-off.
    * Windows stay registered across a cut-off, but the endpoint's name
    * can change with it, so a token issued before it can stop working.
@@ -246,6 +266,15 @@ public:
     /// budget they protected
     uint64_t cutoffs_failed = 0;
     uint64_t cutoffs_late = 0;
+    /// late writes cut off one by one, by cancelling their operations; and
+    /// cancels that failed, after which the endpoint was reset instead
+    uint64_t plans_cut_off = 0;
+    uint64_t cancels_failed = 0;
+    /// the provider promises that fi_cancel() discards a write (see
+    /// config_t::per_plan_cutoff); and that closing the endpoint discards
+    /// its writes: 1 yes, 0 no, -1 it does not say
+    bool cancel_discards = false;
+    int close_discards = -1;
     /// writes refused, with nothing sent, for a budget no longer than
     /// the cut-off cost estimate, and that estimate
     uint64_t budget_refused = 0;
