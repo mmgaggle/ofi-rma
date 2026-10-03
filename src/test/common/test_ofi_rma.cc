@@ -673,6 +673,11 @@ struct stalled_t {
     if (!s.ep || !writer || !lend(s, 4 * S)) {
       return false;
     }
+    return connect();
+  }
+  /// connect while the owner polls; a cut-off reopens the writer's
+  /// endpoint, which then has to connect again
+  bool connect() {
     std::atomic<bool> stop{false};
     std::thread poller([&] { while (!stop) s.ep->progress(); });
     iovec iov{src.data(), 4096};
@@ -749,6 +754,43 @@ TEST(OfiCutOffLate, Tcp)
   EXPECT_EQ(1u, st.cutoffs_late);
   EXPECT_EQ(0u, st.cutoffs_failed);
   EXPECT_EQ(-EIO, t.write(2, ms(2000)));
+}
+
+TEST(OfiCutOffCost, LearnsFromCutOffs)
+{
+  // the cut-off cost starts as a guess of 100 ms; a budget no longer
+  // than that is refused, and counted. Cut-offs that take less pull the
+  // estimate down, until that budget is taken again.
+  stalled_t t;
+  if (!t.open(nullptr)) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  auto st = t.writer->stats();
+  EXPECT_EQ(100u, st.cutoff_cost_ms);
+  EXPECT_EQ(-ETIMEDOUT, t.write(0, ms(90)));
+  EXPECT_EQ(1u, t.writer->stats().budget_refused);
+  EXPECT_EQ(0u, t.writer->stats().resets);  // refused: nothing was sent
+
+  uint64_t prev = st.cutoff_cost_ms;
+  for (int i = 0; i < 4; i++) {
+    ASSERT_TRUE(t.connect()) << t.writer->last_error();
+    EXPECT_EQ(-ETIMEDOUT, t.write(i % 4, ms(400)));
+    st = t.writer->stats();
+    EXPECT_EQ(uint64_t(i + 1), st.resets);
+    EXPECT_LE(st.cutoff_cost_ms, prev) << "cut-off " << i;
+    prev = st.cutoff_cost_ms;
+  }
+  // tcp closes and reopens in a few ms, so the estimate fell well below
+  // the guess; a budget just above it is taken now, and cut off
+  ASSERT_LT(st.cutoff_cost_ms, 90u);
+  EXPECT_FALSE(t.writer->unsafe());
+  const auto refused = st.budget_refused;
+  ASSERT_TRUE(t.connect()) << t.writer->last_error();
+  EXPECT_EQ(-ETIMEDOUT, t.write(1, ms(st.cutoff_cost_ms + 60)));
+  st = t.writer->stats();
+  EXPECT_EQ(refused, st.budget_refused);
+  EXPECT_EQ(5u, st.resets);
+  EXPECT_FALSE(t.writer->unsafe()) << t.writer->last_error();
 }
 
 INSTANTIATE_TEST_SUITE_P(

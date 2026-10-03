@@ -303,9 +303,12 @@ struct Endpoint::Impl {
   std::atomic<uint64_t> resets{0};
   std::atomic<uint64_t> cutoffs_failed{0};
   std::atomic<uint64_t> cutoffs_late{0};
-  /// how long a cut-off takes, at most, as measured, in milliseconds; a
-  /// write stops waiting this much before its budget runs out
-  std::atomic<int64_t> reset_cost_ms{100};
+  /// what a cut-off is expected to cost, in milliseconds; a write stops
+  /// waiting this much before its budget runs out. See config_t.
+  std::atomic<int64_t> cutoff_cost_ms{100};
+  std::atomic<uint64_t> budget_refused{0};
+  /// fold a clean cut-off's duration into cutoff_cost_ms
+  void note_cutoff_cost(std::chrono::steady_clock::duration took);
 
   ~Impl();
   /// open the completion queue and the endpoint, bind and enable them,
@@ -839,9 +842,17 @@ void Endpoint::Impl::reset_locked()
       stage_mr = fresh;
     }
   }
-  const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
-    std::chrono::steady_clock::now() - t0);
-  reset_cost_ms = std::max<int64_t>(reset_cost_ms, took.count() + 50);
+  note_cutoff_cost(std::chrono::steady_clock::now() - t0);
+}
+
+void Endpoint::Impl::note_cutoff_cost(std::chrono::steady_clock::duration took)
+{
+  const int64_t ms =
+    std::chrono::duration_cast<std::chrono::milliseconds>(took).count();
+  const int64_t sample = std::min<int64_t>(2 * ms + 20,
+					   cfg.cutoff_cost_max.count());
+  const int64_t cur = cutoff_cost_ms;
+  cutoff_cost_ms = sample >= cur ? sample : cur - (cur - sample) / 4;
 }
 
 Endpoint::Endpoint(std::unique_ptr<Impl> i) : impl(std::move(i)) {}
@@ -852,6 +863,8 @@ std::unique_ptr<Endpoint> Endpoint::open(const config_t& cfg, std::string* err)
 {
   auto d = std::make_unique<Impl>();
   d->cfg = cfg;
+  d->cutoff_cost_ms = std::min(cfg.cutoff_cost_initial,
+			       cfg.cutoff_cost_max).count();
   if (cfg.provider.empty()) {
     *err = "no libfabric provider named";
     return nullptr;
@@ -1079,8 +1092,12 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
     return -E2BIG;
   }
   // stop waiting early enough to cut the writes off within the budget
-  const std::chrono::milliseconds reset_cost{d.reset_cost_ms.load()};
+  const std::chrono::milliseconds reset_cost{d.cutoff_cost_ms.load()};
   if (budget <= reset_cost) {
+    d.budget_refused++;
+    d.set_err("a budget of " + std::to_string(budget.count()) +
+	      " ms is no longer than a cut-off is expected to take (" +
+	      std::to_string(reset_cost.count()) + " ms); nothing sent");
     return -ETIMEDOUT;
   }
   const auto budget_end = std::chrono::steady_clock::now() + budget;
@@ -1273,6 +1290,8 @@ Endpoint::stats_t Endpoint::stats() const
   s.peer_timeouts = d.peer_timeouts;
   s.cutoffs_failed = d.cutoffs_failed;
   s.cutoffs_late = d.cutoffs_late;
+  s.budget_refused = d.budget_refused;
+  s.cutoff_cost_ms = d.cutoff_cost_ms;
   s.unsafe = d.unsafe;
   s.broken = d.broken;
   s.windows = d.nwindows;

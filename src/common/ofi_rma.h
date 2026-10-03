@@ -76,6 +76,16 @@ struct config_t {
   /// write. A provider that offers only FI_THREAD_DOMAIN still works:
   /// see write(). False asks for FI_THREAD_DOMAIN outright.
   bool thread_safe = true;
+  /// What a cut-off is expected to cost: a write stops waiting this long
+  /// before its budget runs out, to cut its writes off in time, and is
+  /// refused when its budget is no longer than that. The first value is a
+  /// guess; each clean cut-off then moves the estimate to twice what it
+  /// took plus 20 ms, at once when that is more, a quarter of the way
+  /// when it is less. It never exceeds cutoff_cost_max, so a budget above
+  /// that is never refused. A cut-off that takes longer than the estimate
+  /// ends after the budget it protects: see write().
+  std::chrono::milliseconds cutoff_cost_initial{100};
+  std::chrono::milliseconds cutoff_cost_max{2000};
   /// for tests: runs on the insert thread just before each
   /// fi_av_insert(), with the peer's name, under the same locks
   std::function<void(const std::string&)> insert_hook;
@@ -182,6 +192,10 @@ public:
     /// budget they protected
     uint64_t cutoffs_failed = 0;
     uint64_t cutoffs_late = 0;
+    /// writes refused, with nothing sent, for a budget no longer than
+    /// the cut-off cost estimate, and that estimate
+    uint64_t budget_refused = 0;
+    uint64_t cutoff_cost_ms = 0;
     bool unsafe = false;
     /// takes no more writes: unsafe, or a cut-off could not reopen it
     bool broken = false;
