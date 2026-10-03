@@ -934,15 +934,54 @@ TEST(OfiLateCutOff, WithinToleranceIsCounted)
   EXPECT_FALSE(st.unsafe) << t.writer->last_error();
   EXPECT_NE(std::string::npos, t.writer->last_error().find("within the tolerance"))
     << t.writer->last_error();
+  // nothing else polled meanwhile: the message names the pause
+  EXPECT_NE(std::string::npos, t.writer->last_error().find("did not run"))
+    << t.writer->last_error();
+  EXPECT_EQ(0u, st.cutoffs_past_tolerance);
 }
 
-TEST(OfiLateCutOff, BeyondToleranceIsUnsafe)
+TEST(OfiLateCutOff, PausedPastToleranceGoesOn)
 {
-  idle_writer_t idle(ms(800));
+  // The only thread of the writer is left idle 1.2 s near its deadline,
+  // as a stopped or paused process would be: the cut-off starts long
+  // after it, and ends past the 200 ms tolerance, but the close is quick
+  // and leaves the endpoint clean. It is counted and named as a pause,
+  // and the endpoint goes on.
+  idle_writer_t idle(ms(1200));
   stalled_t t;
   if (!t.open(nullptr, [&](config_t& c) {
 	c.wait_hook = idle.hook();
 	c.late_tolerance = ms(200);
+      })) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  idle_writer_t::mine = true;
+  EXPECT_EQ(-ETIMEDOUT, t.write(0, ms(600)));
+  idle_writer_t::mine = false;
+  auto st = t.writer->stats();
+  EXPECT_EQ(1u, st.cutoffs_late);
+  EXPECT_EQ(1u, st.cutoffs_past_tolerance);
+  EXPECT_GE(st.max_poll_gap_ms, 1000u);
+  EXPECT_FALSE(st.unsafe);
+  const auto e = t.writer->last_error();
+  EXPECT_NE(std::string::npos, e.find("beyond the tolerance")) << e;
+  EXPECT_NE(std::string::npos, e.find("did not run")) << e;
+  EXPECT_NE(std::string::npos, e.find("the endpoint goes on")) << e;
+  // and it still cuts writes off, and delivers
+  ASSERT_TRUE(t.connect()) << t.writer->last_error();
+  EXPECT_EQ(-ETIMEDOUT, t.write(1, ms(600)));
+  EXPECT_FALSE(t.writer->unsafe());
+}
+
+TEST(OfiLateCutOff, PausedPastToleranceFailClosed)
+{
+  // the same with late_fail_closed: the endpoint turns unsafe
+  idle_writer_t idle(ms(1200));
+  stalled_t t;
+  if (!t.open(nullptr, [&](config_t& c) {
+	c.wait_hook = idle.hook();
+	c.late_tolerance = ms(200);
+	c.late_fail_closed = true;
       })) {
     GTEST_SKIP() << "tcp is not available";
   }

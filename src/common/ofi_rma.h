@@ -96,6 +96,14 @@ struct config_t {
   /// a client that gave a request up must allow this much beyond the
   /// pool's lease and drain.
   std::chrono::milliseconds late_tolerance{1000};
+  /// A cut-off that took no longer than late_tolerance but ended later
+  /// than it, because the thread that should have started it did not run
+  /// in time (a process stopped, paused, swapped out or starved), leaves
+  /// the endpoint clean: the close or cancel returned, so nothing of the
+  /// writes it cut off is sent any more. By default it is counted
+  /// (cutoffs_past_tolerance), said in last_error(), and the endpoint
+  /// goes on. True makes the endpoint unsafe instead.
+  bool late_fail_closed = false;
   /// for tests: runs in a waiting write, without the endpoint's lock,
   /// each time it wakes, with the time it is to cut its writes off; a
   /// test sleeps in it to stand for a writer the scheduler left idle
@@ -240,7 +248,12 @@ public:
    * writer's behalf, so a writer the scheduler left idle is cut off in
    * time anyway. A cut-off that still ends after the budget, within
    * config_t::late_tolerance, is counted and the write returns
-   * -ETIMEDOUT; beyond it, -ENOTRECOVERABLE.
+   * -ETIMEDOUT. One that ends later still, though the close or cancel
+   * itself was quick, is counted as past the tolerance, and the write
+   * returns -ETIMEDOUT; the endpoint goes on, unless
+   * config_t::late_fail_closed. A close or cancel that itself takes
+   * longer than the tolerance makes the endpoint unsafe, and the writes
+   * whose budgets ran out return -ENOTRECOVERABLE.
    *
    * The first write to a peer adds it to the address vector. Some
    * providers take long for that: the UET reference provider waits for
@@ -297,6 +310,13 @@ public:
     uint64_t max_cutoff_lateness_ms = 0;
     std::chrono::steady_clock::time_point last_late_cutoff{};
     uint64_t cutoffs_on_behalf = 0;
+    /// of cutoffs_late, those beyond late_tolerance that left the endpoint
+    /// clean, and when the last was; the longest the endpoint went
+    /// unpolled, a sign of its threads not running, and when
+    uint64_t cutoffs_past_tolerance = 0;
+    std::chrono::steady_clock::time_point last_past_cutoff{};
+    uint64_t max_poll_gap_ms = 0;
+    std::chrono::steady_clock::time_point last_long_poll_gap{};
     /// the scheduling slack a write keeps ahead of its budget's end, on
     /// top of cutoff_cost_ms, and the tolerance
     uint64_t cutoff_slack_ms = 0;

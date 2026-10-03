@@ -394,6 +394,15 @@ struct Endpoint::Impl {
   std::atomic<uint64_t> cutoffs_on_behalf{0};
   std::atomic<uint64_t> max_lateness_ms{0};
   std::atomic<int64_t> last_late_ns{0};  ///< steady clock, since its epoch
+  std::atomic<uint64_t> cutoffs_past_tolerance{0};
+  std::atomic<int64_t> last_past_ns{0};
+  /// the gap between the last two polls of the endpoint, the longest, and
+  /// when that was: a long one means its threads did not run
+  std::chrono::steady_clock::duration last_poll_gap{};
+  std::atomic<uint64_t> max_poll_gap_ms{0};
+  std::atomic<int64_t> last_long_gap_ns{0};
+  /// how late the cut-off being judged started, for its message
+  std::chrono::steady_clock::duration notice_delay{};
   /// when the completion queue was last polled
   std::chrono::steady_clock::time_point last_poll{};
   /// fold how long after a plan's deadline its cut-off started into the
@@ -407,7 +416,8 @@ struct Endpoint::Impl {
   /// judge a cut-off that ran from t0 to cut against the earliest budget
   /// end of the plans it cut: record lateness, and say why in
   /// last_error(); false when it is beyond the tolerance
-  bool judge_cutoff_locked(std::chrono::steady_clock::time_point t0,
+  enum class verdict { in_time, late, past_tolerance, unsafe };
+  verdict judge_cutoff_locked(std::chrono::steady_clock::time_point t0,
 			   std::chrono::steady_clock::time_point cut,
 			   std::chrono::steady_clock::time_point budget_end);
   std::atomic<uint64_t> late_starts{0};
@@ -623,7 +633,19 @@ void Endpoint::Impl::complete_locked(op_t* op, int err)
 
 size_t Endpoint::Impl::poll_locked()
 {
-  last_poll = std::chrono::steady_clock::now();
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if (last_poll != std::chrono::steady_clock::time_point{}) {
+      last_poll_gap = now - last_poll;
+      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	last_poll_gap).count();
+      if (ms >= 1000) {
+	last_long_gap_ns = now.time_since_epoch().count();
+	max_poll_gap_ms = std::max<uint64_t>(max_poll_gap_ms, ms);
+      }
+    }
+    last_poll = now;
+  }
   size_t got = 0;
   if (!cq || zombie) {
     return got;
@@ -1149,15 +1171,16 @@ void Endpoint::Impl::reset_locked()
       earliest = std::min(earliest, p->budget_end);
     }
   }
-  const bool in_time = judge_cutoff_locked(t0, cut, earliest);
+  const verdict v = judge_cutoff_locked(t0, cut, earliest);
+  const bool unsafe_now = v == verdict::unsafe;
   for (auto& p : plans) {
     if (p->outstanding == 0) {
       continue;
     }
     p->outstanding = 0;
-    if (!in_time && cut > p->budget_end) {
+    if (unsafe_now && cut > p->budget_end) {
       p->err = -ENOTRECOVERABLE;
-    } else if (p->due) {
+    } else if (p->due || cut > p->budget_end) {
       p->err = -ETIMEDOUT;
     } else if (!p->err) {
       p->err = -ECANCELED;
@@ -1165,7 +1188,7 @@ void Endpoint::Impl::reset_locked()
     p->due = false;
   }
   done_cv.notify_all();
-  if (!in_time) {
+  if (unsafe_now) {
     // closed, and not opened again: take no more writes
     unsafe = true;
     broken = true;
@@ -1219,7 +1242,7 @@ bool Endpoint::Impl::time_to_post_locked(
   return std::chrono::steady_clock::now() + need < deadline;
 }
 
-bool Endpoint::Impl::judge_cutoff_locked(
+Endpoint::Impl::verdict Endpoint::Impl::judge_cutoff_locked(
   std::chrono::steady_clock::time_point t0,
   std::chrono::steady_clock::time_point cut,
   std::chrono::steady_clock::time_point budget_end)
@@ -1235,21 +1258,45 @@ bool Endpoint::Impl::judge_cutoff_locked(
     max_lateness_ms = std::max<uint64_t>(max_lateness_ms, late_ms);
     last_late_ns = cut.time_since_epoch().count();
   }
-  const std::string what = "a cut-off took " +
+  std::string what = "a cut-off took " +
     std::to_string(duration_cast<milliseconds>(took).count()) +
     " ms and ended " + std::to_string(late_ms) +
     " ms after the budget it protected";
-  if (took > cfg.late_tolerance || late > cfg.late_tolerance) {
-    set_err(what + ", beyond the tolerance of " +
-	    std::to_string(cfg.late_tolerance.count()) +
-	    " ms; writes may have landed late");
-    return false;
+  if (late.count() > 0) {
+    const int64_t started_ms =
+      duration_cast<milliseconds>(notice_delay).count();
+    const int64_t gap_ms = duration_cast<milliseconds>(last_poll_gap).count();
+    what += "; it started " + std::to_string(started_ms) +
+      " ms after its writes' deadline";
+    if (gap_ms > 0 && gap_ms + 50 >= started_ms) {
+      what += ", and nothing polled the endpoint for the " +
+	std::to_string(gap_ms) + " ms before: the process, or its "
+	"threads, did not run (stopped, paused, swapped out or starved)";
+    }
+  }
+  const std::string tolerance = std::to_string(cfg.late_tolerance.count());
+  if (took > cfg.late_tolerance) {
+    // the provider itself takes that long to cut writes off, as one that
+    // drains them instead of discarding does: every cut-off would be late
+    set_err(what + ". The close or cancel itself took longer than the "
+	    "tolerance of " + tolerance + " ms; writes may have landed late");
+    return verdict::unsafe;
+  }
+  if (late > cfg.late_tolerance) {
+    // started late; the endpoint is clean now, since the close or cancel
+    // returned
+    cutoffs_past_tolerance++;
+    last_past_ns = cut.time_since_epoch().count();
+    set_err(what + ", beyond the tolerance of " + tolerance +
+	    " ms; writes may have landed late" +
+	    (cfg.late_fail_closed ? "" : ", and the endpoint goes on"));
+    return cfg.late_fail_closed ? verdict::unsafe : verdict::past_tolerance;
   }
   if (late.count() > 0) {
-    set_err(what + ", within the tolerance of " +
-	    std::to_string(cfg.late_tolerance.count()) + " ms");
+    set_err(what + ", within the tolerance of " + tolerance + " ms");
+    return verdict::late;
   }
-  return true;
+  return verdict::in_time;
 }
 
 void Endpoint::Impl::note_notice_delay(std::chrono::steady_clock::duration d)
@@ -1269,7 +1316,8 @@ void Endpoint::Impl::cut_off_locked(plan_t* p,
 				    std::chrono::steady_clock::time_point noticed)
 {
   timeouts++;
-  note_notice_delay(noticed - p->deadline);
+  notice_delay = noticed - p->deadline;
+  note_notice_delay(notice_delay);
   const auto t0 = std::chrono::steady_clock::now();
   if (cancel_discards) {
     // only this write's operations, if the provider discards them
@@ -1287,7 +1335,7 @@ void Endpoint::Impl::cut_off_locked(plan_t* p,
 	hook_cancelled.push_back(std::move(*p->self));
 	plans.erase(p->self);
       }
-      if (!judge_cutoff_locked(t0, cut, p->budget_end)) {
+      if (judge_cutoff_locked(t0, cut, p->budget_end) == verdict::unsafe) {
 	p->cut_result = cut > p->budget_end ? -ENOTRECOVERABLE : -ETIMEDOUT;
 	stop_unsafe_locked(get_err());
 	return;
@@ -1921,6 +1969,12 @@ Endpoint::stats_t Endpoint::stats() const
   s.last_late_cutoff = std::chrono::steady_clock::time_point(
     std::chrono::steady_clock::duration(d.last_late_ns.load()));
   s.cutoffs_on_behalf = d.cutoffs_on_behalf;
+  s.cutoffs_past_tolerance = d.cutoffs_past_tolerance;
+  s.last_past_cutoff = std::chrono::steady_clock::time_point(
+    std::chrono::steady_clock::duration(d.last_past_ns.load()));
+  s.max_poll_gap_ms = d.max_poll_gap_ms;
+  s.last_long_poll_gap = std::chrono::steady_clock::time_point(
+    std::chrono::steady_clock::duration(d.last_long_gap_ns.load()));
   s.cutoff_slack_ms = d.cutoff_slack_ms;
   s.late_tolerance_ms = d.cfg.late_tolerance.count();
   s.late_starts = d.late_starts;
