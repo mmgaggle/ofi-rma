@@ -13,6 +13,8 @@
 #include <thread>
 #include <vector>
 
+#include <sys/resource.h>
+
 #include <gtest/gtest.h>
 
 using namespace ceph::ofi;
@@ -516,6 +518,142 @@ TEST(OfiPeerInsertDomain, Tcp)
   EXPECT_EQ(0, memcmp(b.mem.data(), src.data(), N));
   EXPECT_EQ(1, gate->count(a.tok.name));
 }
+
+namespace {
+
+/// CPU time this process used so far, user and system
+std::chrono::duration<double> cpu_used()
+{
+  rusage r;
+  getrusage(RUSAGE_SELF, &r);
+  return std::chrono::duration<double>(
+    r.ru_utime.tv_sec + r.ru_stime.tv_sec +
+    (r.ru_utime.tv_usec + r.ru_stime.tv_usec) / 1e6);
+}
+
+class OfiConcurrentWrites : public ::testing::TestWithParam<std::pair<const char*, const char*>> {};
+
+} // anonymous namespace
+
+TEST_P(OfiConcurrentWrites, AllComplete)
+{
+  // many writers share the endpoint: every write completes, whichever of
+  // them polls, and every byte lands where it should
+  auto [prov, node] = GetParam();
+  auto gate = std::make_shared<gate_t>();
+  window_owner_t a;
+  a.ep = open_target(prov, node);
+  const int T = 16, K = 20;
+  const size_t S = 256 << 10;
+  auto writer = open_writer(prov, node, true, S, T, gate);
+  if (!a.ep || !writer) {
+    GTEST_SKIP() << prov << " is not available";
+  }
+  ASSERT_TRUE(lend(a, T * S));
+  std::vector<std::vector<char>> src(T, std::vector<char>(S));
+  for (int t = 0; t < T; t++) {
+    for (size_t i = 0; i < S; i++) {
+      src[t][i] = static_cast<char>(i * 3 + t * 101);
+    }
+  }
+  std::atomic<int> failed{0};
+  std::vector<std::thread> ts;
+  for (int t = 0; t < T; t++) {
+    ts.emplace_back([&, t] {
+      iovec iov{src[t].data(), S};
+      std::vector<Endpoint::write_t> one = {{0, S, t * S}};
+      for (int k = 0; k < K; k++) {
+	if (writer->write(a.tok, &iov, 1, one, BUDGET) != 0) {
+	  failed++;
+	}
+      }
+    });
+  }
+  for (auto& t : ts) {
+    t.join();
+  }
+  EXPECT_EQ(0, failed.load()) << writer->last_error();
+  a.ep->sync();
+  for (int t = 0; t < T; t++) {
+    EXPECT_EQ(0, memcmp(a.mem.data() + t * S, src[t].data(), S)) << "writer " << t;
+  }
+  const auto st = writer->stats();
+  EXPECT_EQ(uint64_t(T * K), st.writes_posted);
+  EXPECT_EQ(0u, st.resets);
+  EXPECT_EQ(0u, st.staging_busy);
+}
+
+TEST(OfiConcurrentWritesStalled, Tcp)
+{
+  // Writes into a window owner that stopped polling cannot complete.
+  // While they wait, they must not burn CPU: one of them polls, the
+  // others sleep. The first to reach its deadline cuts them all off at
+  // once, and the others hear of it then, not at their own deadlines.
+  auto gate = std::make_shared<gate_t>();
+  window_owner_t s;
+  s.ep = open_target("tcp", "127.0.0.1", false);
+  const int T = 8;
+  const size_t S = 4 << 20;
+  auto writer = open_writer("tcp", "127.0.0.1", true, S, T, gate);
+  if (!s.ep || !writer) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  ASSERT_TRUE(lend(s, T * S));
+  std::vector<char> src(S, 'z');
+  iovec iov{src.data(), S};
+  {
+    // connect while the owner polls
+    std::atomic<bool> stop{false};
+    std::thread poller([&] { while (!stop) s.ep->progress(); });
+    std::vector<Endpoint::write_t> one = {{0, 4096, 0}};
+    EXPECT_EQ(0, writer->write(s.tok, &iov, 1, one, BUDGET)) << writer->last_error();
+    stop = true;
+    poller.join();
+  }
+  const auto resets0 = writer->stats().resets;
+  std::vector<int> rc(T, 1);
+  std::vector<std::chrono::steady_clock::duration> took(T);
+  const auto cpu0 = cpu_used();
+  const auto t0 = clk::now();
+  std::vector<std::thread> ts;
+  for (int t = 0; t < T; t++) {
+    ts.emplace_back([&, t] {
+      std::vector<Endpoint::write_t> one = {{0, S, t * S}};
+      // the first writer has the shortest budget
+      const ms budget(t == 0 ? 800 : 2000);
+      const auto a = clk::now();
+      rc[t] = writer->write(s.tok, &iov, 1, one, budget);
+      took[t] = clk::now() - a;
+    });
+    if (t == 0) {
+      std::this_thread::sleep_for(ms(20));  // it posts first
+    }
+  }
+  for (auto& t : ts) {
+    t.join();
+  }
+  const auto wall = std::chrono::duration<double>(clk::now() - t0);
+  const auto cpu = cpu_used() - cpu0;
+  EXPECT_EQ(-ETIMEDOUT, rc[0]);
+  EXPECT_LT(took[0], ms(800));    // within its budget, cut-off included
+  EXPECT_GT(took[0], ms(400));    // and not much before it
+  for (int t = 1; t < T; t++) {
+    // cut off with the first, long before their own deadlines
+    EXPECT_TRUE(rc[t] == -ECANCELED || rc[t] == -ETIMEDOUT) << rc[t];
+    EXPECT_LT(took[t], ms(1200)) << "writer " << t;
+  }
+  EXPECT_EQ(resets0 + 1, writer->stats().resets);
+  // eight writes waited for most of a second: well under one core between
+  // them (spinning, they used about six)
+  EXPECT_LT(cpu.count(), 0.5 * wall.count())
+    << "cpu " << cpu.count() << " s over " << wall.count() << " s";
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  Providers, OfiConcurrentWrites,
+  ::testing::Values(std::make_pair("tcp", "127.0.0.1"),
+		    std::make_pair("shm", "")),
+  [](const auto& info) { return std::string(info.param.first); });
 
 INSTANTIATE_TEST_SUITE_P(
   Providers, OfiPeerInsert,

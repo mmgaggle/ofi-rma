@@ -22,6 +22,8 @@
 #include <mutex>
 #include <thread>
 
+#include <poll.h>
+
 namespace ceph::ofi {
 
 namespace {
@@ -36,6 +38,21 @@ constexpr size_t MAX_PEERS = 1024;
 /// how long a failed address insert is remembered: writes to the peer
 /// fail at once until then, instead of queueing another slow insert
 constexpr std::chrono::seconds INSERT_RETRY{1};
+/// A write that polls for the others sleeps between polls only when the
+/// completion queue has no wait object. It polls with only a yield in
+/// between until SPIN_TIME has passed without a sign of work, then sleeps
+/// WAIT_SLEEP between polls. A sign of work is a completion, or a poll
+/// that took clearly longer than an idle one (POLL_BUSY_MARGIN beyond
+/// twice the shortest poll seen): a provider that progresses only while
+/// polled, as the UET reference provider does, moves data in its polls
+/// long before the write completes. A sleep lasts about 50 us more than
+/// asked, the kernel's default timer slack.
+constexpr std::chrono::microseconds SPIN_TIME{200};
+constexpr std::chrono::microseconds WAIT_SLEEP{50};
+constexpr std::chrono::microseconds POLL_BUSY_MARGIN{2};
+/// longest a write blocks on the completion queue's wait object before
+/// it looks again; bounds how late it notices a cut-off
+constexpr std::chrono::milliseconds WAIT_MAX{1};
 /// the API version asked for: old enough for a provider built against
 /// 1.x headers, new enough for FI_CONTEXT2 and the mr_mode bits used
 constexpr uint32_t API_VERSION = FI_VERSION(1, 18);
@@ -166,6 +183,8 @@ struct Endpoint::Impl {
   fid_av* av = nullptr;
   fid_cq* cq = nullptr;
   fid_ep* ep = nullptr;
+  /// the completion queue's wait object, or -1 when it has none
+  int cq_fd = -1;
   std::string prov;
   std::string my_name;
   uint64_t mr_mode = 0;
@@ -232,12 +251,20 @@ struct Endpoint::Impl {
     std::vector<op_t> ops;  ///< reserved up front, never reallocated
     uint32_t outstanding = 0;
     int err = 0;
-    bool abandoned = false;  ///< its caller timed out and left
     size_t slot = 0;
     std::string peer;
     std::list<std::unique_ptr<plan_t>>::iterator self;
   };
   std::list<std::unique_ptr<plan_t>> plans;
+  /// Waiting writes. One of them, the poller, polls the completion queue
+  /// for all; the others sleep on done_cv until a plan finishes, the
+  /// poller leaves, or a cut-off fails them.
+  std::condition_variable_any done_cv;
+  bool poller = false;
+  /// the shortest poll the poller has timed: what a poll costs when the
+  /// provider has nothing to do
+  std::chrono::steady_clock::duration poll_floor =
+    std::chrono::steady_clock::duration::max();
 
   std::thread progress_thr;
   std::atomic<bool> stopping{false};
@@ -280,8 +307,14 @@ struct Endpoint::Impl {
   /// register memory; a region others write into needs a key, a local
   /// write source only a descriptor
   int reg(char* ptr, size_t len, uint64_t access, region_t* out);
-  void poll_locked();
+  /// one pass over the completion queue; returns the completions read
+  size_t poll_locked();
   void complete_locked(op_t* op, int err);
+  /// between two polls of a waiting write: drop the lock until the
+  /// completion queue has something, or briefly, never past deadline
+  void wait_cq(std::unique_lock<std::timed_mutex>& l,
+	       std::chrono::steady_clock::time_point deadline,
+	       std::chrono::steady_clock::time_point spin_until);
   void retire_locked(plan_t* p);
 
   using time_point = std::chrono::steady_clock::time_point;
@@ -315,8 +348,8 @@ Endpoint::Impl::~Impl()
   if (insert_thr.joinable()) {
     insert_thr.join();
   }
-  // the endpoint first: it cancels whatever an abandoned plan still has
-  // in flight, after which no write references the regions
+  // the endpoint first: it cancels whatever is still in flight, after
+  // which no write references the regions
   if (ep) fi_close(&ep->fid);
   for (auto& [id, w] : windows) {
     fi_close(&w.mr->fid);
@@ -380,35 +413,38 @@ void Endpoint::Impl::complete_locked(op_t* op, int err)
       p->err = err;
     }
   }
-  if (p->abandoned && p->outstanding == 0) {
-    retire_locked(p);
+  if (p->outstanding == 0) {
+    done_cv.notify_all();
   }
 }
 
-void Endpoint::Impl::poll_locked()
+size_t Endpoint::Impl::poll_locked()
 {
+  size_t got = 0;
   if (!cq) {
-    return;
+    return got;
   }
   fi_cq_entry ent[16];
   for (int round = 0; round < 8; round++) {
     const ssize_t n = fi_cq_read(cq, ent, 16);
     if (n > 0) {
+      got += n;
       for (ssize_t i = 0; i < n; i++) {
 	if (ent[i].op_context) {
 	  complete_locked(static_cast<op_t*>(ent[i].op_context), 0);
 	}
       }
       if (n < 16) {
-	return;
+	return got;
       }
       continue;
     }
     if (n == -FI_EAVAIL) {
       fi_cq_err_entry e{};
       if (fi_cq_readerr(cq, &e, 0) < 0) {
-	return;
+	return got;
       }
+      got++;
       const char* text = fi_cq_strerror(cq, e.prov_errno, e.err_data,
 					nullptr, 0);
       set_err(fi_err(e.err) + (text ? std::string(" (") + text + ")" : ""));
@@ -418,8 +454,54 @@ void Endpoint::Impl::poll_locked()
       }
       continue;
     }
-    return;  // -FI_EAGAIN: nothing more, or an error with no entry
+    return got;  // -FI_EAGAIN: nothing more, or an error with no entry
   }
+  return got;
+}
+
+void Endpoint::Impl::wait_cq(std::unique_lock<std::timed_mutex>& l,
+			     std::chrono::steady_clock::time_point deadline,
+			     std::chrono::steady_clock::time_point spin_until)
+{
+  const auto now = std::chrono::steady_clock::now();
+  const auto left = deadline - now;
+  if (left <= left.zero()) {
+    return;
+  }
+  if (cq_fd >= 0) {
+    // the provider signals the wait object when a completion is ready;
+    // fi_trywait() says whether one already is
+    fid* f = &cq->fid;
+    if (fi_trywait(fabric, &f, 1) != FI_SUCCESS) {
+      // something to read already; let others at the endpoint first
+      l.unlock();
+      std::this_thread::yield();
+      l.lock();
+      return;
+    }
+    const int fd = cq_fd;
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::min<std::chrono::steady_clock::duration>(left, WAIT_MAX)).count();
+    const timespec ts{static_cast<time_t>(ns / 1000000000),
+		      static_cast<long>(ns % 1000000000)};
+    pollfd pfd{fd, POLLIN, 0};
+    l.unlock();
+    // a cut-off can close the fd meanwhile; the wait then just runs out
+    ppoll(&pfd, 1, &ts, nullptr);
+    l.lock();
+    return;
+  }
+  // No wait object: the provider makes progress only while it is polled
+  // (manual progress), or tells nobody when it has. Poll again soon, but
+  // without burning a core on a queue that stays empty.
+  l.unlock();
+  if (now < spin_until) {
+    std::this_thread::yield();
+  } else {
+    std::this_thread::sleep_for(
+      std::min<std::chrono::steady_clock::duration>(left, WAIT_SLEEP));
+  }
+  l.lock();
 }
 
 int Endpoint::Impl::get_peer(const std::string& name, time_point deadline,
@@ -579,12 +661,23 @@ int Endpoint::Impl::open_ep(std::string* err)
   fi_cq_attr cq_attr{};
   cq_attr.format = FI_CQ_FORMAT_CONTEXT;
   cq_attr.size = 4096;
-  cq_attr.wait_obj = FI_WAIT_NONE;
-  int r;
-  if ((r = fi_cq_open(domain, &cq_attr, &cq, nullptr))) {
-    cq = nullptr;
-    *err = "fi_cq_open: " + fi_err(r);
-    return to_errno(r);
+  // a completion queue with a file descriptor to wait on, if the
+  // provider has one, so that a waiting write need not poll
+  cq_fd = -1;
+  cq_attr.wait_obj = FI_WAIT_FD;
+  int r = fi_cq_open(domain, &cq_attr, &cq, nullptr);
+  if (!r && (fi_control(&cq->fid, FI_GETWAIT, &cq_fd) || cq_fd < 0)) {
+    cq_fd = -1;
+    fi_close(&cq->fid);
+    r = -FI_ENOSYS;
+  }
+  if (r) {
+    cq_attr.wait_obj = FI_WAIT_NONE;
+    if ((r = fi_cq_open(domain, &cq_attr, &cq, nullptr))) {
+      cq = nullptr;
+      *err = "fi_cq_open: " + fi_err(r);
+      return to_errno(r);
+    }
   }
   if ((r = fi_endpoint(domain, info, &ep, nullptr))) {
     ep = nullptr;
@@ -627,22 +720,22 @@ void Endpoint::Impl::reset_locked()
   if (cq) {
     fi_close(&cq->fid);
     cq = nullptr;
+    cq_fd = -1;
   }
-  // every plan still waiting has lost its writes; one that posted none
-  // yet (its writer is gathering the source) has lost nothing
-  for (auto it = plans.begin(); it != plans.end(); ) {
-    plan_t* p = (it++)->get();
-    if (p->ops.empty()) {
+  // every plan with writes in flight has lost them, and its writer has
+  // to hear it. One with none in flight has lost nothing: it is done, or
+  // its writer is still gathering or posting and goes on with the new
+  // endpoint.
+  for (auto& p : plans) {
+    if (p->outstanding == 0) {
       continue;
     }
     p->outstanding = 0;
     if (!p->err) {
       p->err = -ECANCELED;
     }
-    if (p->abandoned) {
-      retire_locked(p);
-    }
   }
+  done_cv.notify_all();
   // regions bound to the old endpoint are gone with it
   const bool rebind = mr_mode & FI_MR_ENDPOINT;
   if (rebind) {
@@ -988,17 +1081,27 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
 			   dst.base + w.dst_ofs + o, dst.key, &op.ctx)) ==
 	     -FI_EAGAIN) {
 	// the transmit queue is full: progress, which completes what
-	// is out, then retry
+	// is out, then retry, letting others at the endpoint meanwhile
 	d.poll_locked();
 	if (std::chrono::steady_clock::now() > deadline) {
 	  break;
 	}
+	l.unlock();
+	std::this_thread::yield();
+	l.lock();
+	if (plan->err || d.broken) {
+	  break;  // a cut-off took what this plan had posted
+	}
       }
-      if (r) {
-	d.set_err("fi_write: " + fi_err(r));
-	d.writes_failed++;
-	plan->err = r == -FI_EAGAIN ? -ETIMEDOUT : to_errno(r);
+      if (r || plan->err || d.broken) {
 	plan->ops.pop_back();
+	if (!plan->err) {
+	  d.set_err(d.broken ? std::string("the endpoint is broken") :
+		    "fi_write: " + fi_err(r));
+	  d.writes_failed++;
+	  plan->err = r == -FI_EAGAIN ? -ETIMEDOUT :
+	    d.broken ? -EIO : to_errno(r);
+	}
 	break;
       }
       plan->outstanding++;
@@ -1010,9 +1113,22 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
     }
   }
 
+  // Wait for the writes. One waiting write polls the completion queue
+  // for all of them, which drives the provider if it progresses only
+  // while polled; the others sleep until a plan finishes, the poller
+  // leaves, or a cut-off fails them, and each wakes at its deadline.
+  bool polling = false;
+  auto spin_until = std::chrono::steady_clock::time_point{};
+  auto leave = [&] {
+    if (polling) {
+      polling = false;
+      d.poller = false;
+      d.done_cv.notify_all();
+    }
+  };
   while (true) {
-    d.poll_locked();
     if (plan->outstanding == 0) {
+      leave();
       const int res = plan->err;
       if (!res) {
 	d.bytes_written += total;
@@ -1021,17 +1137,38 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
       return res;
     }
     if (std::chrono::steady_clock::now() > deadline) {
+      // a last look: what completed during the wait counts
+      d.poll_locked();
+      if (plan->outstanding == 0) {
+	continue;
+      }
       // out of budget with writes in flight: cut them off, so none of
       // them lands in the peer's window after the caller gave up
+      leave();
       d.timeouts++;
       d.set_err("writes still in flight at the deadline; cut off");
       d.reset_locked();
       d.retire_locked(plan);
       return -ETIMEDOUT;
     }
-    l.unlock();
-    std::this_thread::yield();
-    l.lock();
+    if (!polling && !d.poller) {
+      polling = d.poller = true;
+      spin_until = std::chrono::steady_clock::now() + SPIN_TIME;
+    }
+    if (!polling) {
+      d.done_cv.wait_until(l, deadline);
+      continue;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const size_t got = d.poll_locked();
+    const auto t1 = std::chrono::steady_clock::now();
+    d.poll_floor = std::min(d.poll_floor, t1 - t0);
+    if (got || t1 - t0 > 2 * d.poll_floor + POLL_BUSY_MARGIN) {
+      spin_until = t1 + SPIN_TIME;
+    }
+    if (plan->outstanding) {
+      d.wait_cq(l, deadline, spin_until);
+    }
   }
 }
 
