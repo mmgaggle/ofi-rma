@@ -89,6 +89,9 @@ struct config_t {
   /// for tests: runs on the insert thread just before each
   /// fi_av_insert(), with the peer's name, under the same locks
   std::function<void(const std::string&)> insert_hook;
+  /// for tests: runs in write() after the source is gathered, without
+  /// the endpoint's lock, just before the last look at the time left
+  std::function<void()> pre_post_hook;
   /// for tests: runs in a cut-off just before the endpoint is closed. A
   /// nonzero return stands for fi_close() failing with it, and the
   /// endpoint stays open.
@@ -155,6 +158,13 @@ public:
    * Windows stay registered across a cut-off, but the endpoint's name
    * can change with it, so a token issued before it can stop working.
    *
+   * A write that has too little of its budget left when it is about to
+   * post, after waiting for its peer or the endpoint and gathering the
+   * source, returns -ETIMEDOUT having sent nothing, so that it does not
+   * post only to be cut off at once, with every other write in flight.
+   * Too little is less than 1 ms beyond twice the time recent writes of
+   * 1 MiB or more took for as many bytes.
+   *
    * The first write to a peer adds it to the address vector. Some
    * providers take long for that: the UET reference provider pings the
    * peer, for up to 10 seconds. A thread of the endpoint's own does the
@@ -196,6 +206,9 @@ public:
     /// the cut-off cost estimate, and that estimate
     uint64_t budget_refused = 0;
     uint64_t cutoff_cost_ms = 0;
+    /// writes that did not start, with nothing sent, because too little
+    /// of their budget was left to post them
+    uint64_t late_starts = 0;
     bool unsafe = false;
     /// takes no more writes: unsafe, or a cut-off could not reopen it
     bool broken = false;

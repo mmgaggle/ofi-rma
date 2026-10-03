@@ -756,6 +756,66 @@ TEST(OfiCutOffLate, Tcp)
   EXPECT_EQ(-EIO, t.write(2, ms(2000)));
 }
 
+TEST(OfiLateStart, DoesNotCutOffOthers)
+{
+  // A write that reaches the point of posting with its budget nearly
+  // spent (here the test holds it there) must give up having sent
+  // nothing. Posting would cut its writes off at once, and with them the
+  // writes of everyone else in flight.
+  window_owner_t s;
+  s.ep = open_target("tcp", "127.0.0.1", false);
+  std::atomic<int> calls{0};
+  config_t c;
+  c.provider = "tcp";
+  c.node = "127.0.0.1";
+  c.stage_size = 4 << 20;
+  c.stage_count = 4;
+  c.pre_post_hook = [&] {
+    if (++calls == 3) {  // the late write: past its 600 ms budget
+      std::this_thread::sleep_for(ms(700));
+    }
+  };
+  std::string err;
+  auto writer = Endpoint::open(c, &err);
+  if (!s.ep || !writer) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  const size_t S = 4 << 20;
+  ASSERT_TRUE(lend(s, 4 * S));
+  std::vector<char> src(S, 'p');
+  {
+    std::atomic<bool> stop{false};
+    std::thread poller([&] { while (!stop) s.ep->progress(); });
+    iovec iov{src.data(), 4096};
+    std::vector<Endpoint::write_t> one = {{0, 4096, 0}};
+    EXPECT_EQ(0, writer->write(s.tok, &iov, 1, one, BUDGET));  // call 1
+    stop = true;
+    poller.join();
+  }
+  // a write in flight into the stalled owner, with plenty of budget
+  std::atomic<int> r_long{1};
+  std::chrono::steady_clock::duration took_long{};
+  std::thread a([&] {
+    iovec iov{src.data(), S};
+    std::vector<Endpoint::write_t> one = {{0, S, 0}};
+    const auto t0 = clk::now();
+    r_long = writer->write(s.tok, &iov, 1, one, ms(2500));  // call 2
+    took_long = clk::now() - t0;
+  });
+  std::this_thread::sleep_for(ms(50));
+  iovec iov{src.data(), S};
+  std::vector<Endpoint::write_t> one = {{0, S, S}};
+  EXPECT_EQ(-ETIMEDOUT, writer->write(s.tok, &iov, 1, one, ms(600)));  // 3
+  EXPECT_EQ(1u, writer->stats().late_starts);
+  EXPECT_EQ(0u, writer->stats().resets);  // nothing was cut off
+  a.join();
+  // the long write ran to its own deadline: cut off then, not cancelled
+  EXPECT_EQ(-ETIMEDOUT, r_long.load());
+  EXPECT_GT(took_long, ms(2000));
+  EXPECT_EQ(1u, writer->stats().resets);
+  EXPECT_FALSE(writer->unsafe());
+}
+
 TEST(OfiCutOffCost, LearnsFromCutOffs)
 {
   // the cut-off cost starts as a guess of 100 ms; a budget no longer

@@ -50,6 +50,11 @@ constexpr std::chrono::seconds INSERT_RETRY{1};
 constexpr std::chrono::microseconds SPIN_TIME{200};
 constexpr std::chrono::microseconds WAIT_SLEEP{50};
 constexpr std::chrono::microseconds POLL_BUSY_MARGIN{2};
+/// the least time a write must have left to post; see write()
+constexpr std::chrono::milliseconds POST_MARGIN{1};
+/// plans this large or larger teach the endpoint how fast plans move;
+/// smaller ones take as long as the network's latency, whatever their size
+constexpr uint64_t RATE_MIN_BYTES = 1 << 20;
 /// longest a write blocks on the completion queue's wait object before
 /// it looks again; bounds how late it notices a cut-off
 constexpr std::chrono::milliseconds WAIT_MAX{1};
@@ -253,6 +258,8 @@ struct Endpoint::Impl {
     int err = 0;
     /// when the caller's budget runs out: nothing may land after it
     std::chrono::steady_clock::time_point budget_end{};
+    /// when its first write was posted
+    std::chrono::steady_clock::time_point posted_at{};
     size_t slot = 0;
     std::string peer;
     std::list<std::unique_ptr<plan_t>>::iterator self;
@@ -307,6 +314,15 @@ struct Endpoint::Impl {
   /// waiting this much before its budget runs out. See config_t.
   std::atomic<int64_t> cutoff_cost_ms{100};
   std::atomic<uint64_t> budget_refused{0};
+  std::atomic<uint64_t> late_starts{0};
+  /// how fast plans of RATE_MIN_BYTES or more complete, from the first
+  /// post to the last completion, in bytes per nanosecond, averaged; 0
+  /// until one has
+  double plan_rate = 0;
+  /// whether a plan of this many bytes can still be posted and complete
+  /// before deadline, by plan_rate
+  bool time_to_post_locked(uint64_t bytes,
+			   std::chrono::steady_clock::time_point deadline) const;
   /// fold a clean cut-off's duration into cutoff_cost_ms
   void note_cutoff_cost(std::chrono::steady_clock::duration took);
 
@@ -845,6 +861,16 @@ void Endpoint::Impl::reset_locked()
   note_cutoff_cost(std::chrono::steady_clock::now() - t0);
 }
 
+bool Endpoint::Impl::time_to_post_locked(
+  uint64_t bytes, std::chrono::steady_clock::time_point deadline) const
+{
+  std::chrono::steady_clock::duration need = POST_MARGIN;
+  if (plan_rate > 0) {
+    need += std::chrono::nanoseconds(static_cast<int64_t>(2 * bytes / plan_rate));
+  }
+  return std::chrono::steady_clock::now() + need < deadline;
+}
+
 void Endpoint::Impl::note_cutoff_cost(std::chrono::steady_clock::duration took)
 {
   const int64_t ms =
@@ -1121,6 +1147,13 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
     d.put_peer(dst.name);
     return -EIO;
   }
+  // waiting for the peer or the endpoint may have eaten the budget
+  if (!d.time_to_post_locked(total, deadline)) {
+    d.late_starts++;
+    d.put_peer(dst.name);
+    d.set_err("too little budget left to start the write; nothing sent");
+    return -ETIMEDOUT;
+  }
   size_t slot = 0;
   while (slot < d.stage_busy.size() && d.stage_busy[slot]) {
     slot++;
@@ -1152,12 +1185,25 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
       p += iov[i].iov_len;
     }
   }
+  if (d.cfg.pre_post_hook) {
+    d.cfg.pre_post_hook();
+  }
   l.lock();
   if (d.broken || !d.ep) {
     // a cut-off failed to reopen the endpoint while we copied
     d.retire_locked(plan);
     return -EIO;
   }
+  // the last look before posting: a write posted with no time left would
+  // be cut off at once, and the cut-off would cancel every other write in
+  // flight on the endpoint
+  if (!d.time_to_post_locked(total, deadline)) {
+    d.late_starts++;
+    d.set_err("too little budget left to start the write; nothing sent");
+    d.retire_locked(plan);
+    return -ETIMEDOUT;
+  }
+  plan->posted_at = std::chrono::steady_clock::now();
 
   for (const auto& w : writes) {
     for (uint64_t o = 0; o < w.len && !plan->err; ) {
@@ -1220,6 +1266,13 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
       const int res = plan->err;
       if (!res) {
 	d.bytes_written += total;
+	const auto took = std::chrono::steady_clock::now() - plan->posted_at;
+	if (total >= RATE_MIN_BYTES && took.count() > 0) {
+	  const double rate = double(total) /
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(took).count();
+	  d.plan_rate = d.plan_rate > 0 ? d.plan_rate + (rate - d.plan_rate) / 8 :
+	    rate;
+	}
       }
       d.retire_locked(plan);
       return res;
@@ -1292,6 +1345,7 @@ Endpoint::stats_t Endpoint::stats() const
   s.cutoffs_late = d.cutoffs_late;
   s.budget_refused = d.budget_refused;
   s.cutoff_cost_ms = d.cutoff_cost_ms;
+  s.late_starts = d.late_starts;
   s.unsafe = d.unsafe;
   s.broken = d.broken;
   s.windows = d.nwindows;
