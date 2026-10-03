@@ -1392,6 +1392,165 @@ TEST_P(OfiRekey, WindowPoolKeepsAFailedPushOut)
 
 namespace {
 
+/// Gathers run side by side the way an OSD's do: each borrows a window
+/// from the pool, the peer pushes a pattern no other push has into it,
+/// and the owner takes what it finds there and gives the window back
+/// with a new key. A push that failed gives its window back unclean.
+/// Every push that succeeded must have left exactly its own bytes, and
+/// nothing else may land in a window while it is lent.
+struct gather_cycle_t {
+  static constexpr size_t W = 128 << 10;
+  WindowPool& pool;
+  Endpoint& owner;
+  Endpoint& pusher;
+  std::atomic<int> taken{0}, failed{0}, wrong{0}, stray{0}, exhausted{0};
+  std::atomic<int> first_rc{0};
+
+  /// rounds per gather at least, and on until *until when given
+  void run(size_t threads, size_t rounds, ms budget,
+	   const std::atomic<bool>* until = nullptr) {
+    std::vector<std::thread> th;
+    for (size_t t = 0; t < threads; t++) {
+      th.emplace_back([&, t] {
+	std::vector<uint64_t> src(W / 8);
+	for (size_t round = 0; round < rounds || (until && !*until);
+	     round++) {
+	  auto lent = pool.acquire(W);
+	  if (!lent) {
+	    exhausted++;
+	    std::this_thread::sleep_for(ms(1));
+	    continue;
+	  }
+	  auto tok = parse_token(lent->token);
+	  // pushes of different lengths, with the gather's thread and
+	  // round in every word
+	  const size_t len = W - (round % 4) * 4096;
+	  for (size_t i = 0; i < len / 8; i++) {
+	    src[i] = (uint64_t(t + 1) << 56) | (uint64_t(round & 0xffffff) << 32) | i;
+	  }
+	  iovec iov{src.data(), len};
+	  std::vector<Endpoint::write_t> all = {{0, len, 0}};
+	  const int r = pusher.write(*tok, &iov, 1, all, budget);
+	  if (r != 0) {
+	    int z = 0;
+	    first_rc.compare_exchange_strong(z, r);
+	    failed++;
+	    pool.release(lent->id, ms(0), true);
+	    continue;
+	  }
+	  owner.sync();
+	  std::vector<char> copy(lent->ptr, lent->ptr + len);
+	  if (std::memcmp(copy.data(), src.data(), len) != 0) {
+	    wrong++;
+	  }
+	  // still lent: nothing may write here now
+	  std::this_thread::sleep_for(std::chrono::microseconds(200));
+	  owner.sync();
+	  if (std::memcmp(lent->ptr, copy.data(), len) != 0) {
+	    stray++;
+	  }
+	  taken++;
+	  pool.release(lent->id, ms(0), true);
+	}
+      });
+    }
+    for (auto& x : th) {
+      x.join();
+    }
+  }
+};
+
+} // anonymous namespace
+
+TEST_P(OfiRekey, GatherCycleTakesOnlyWhatWasPushed)
+{
+  auto [prov, node] = GetParam();
+  auto gate = std::make_shared<gate_t>();
+  window_owner_t a;
+  a.ep = open_target(prov, node);
+  constexpr size_t T = 4, NW = 6, ROUNDS = 200;
+  auto writer = open_writer(prov, node, true, gather_cycle_t::W, T, gate);
+  if (!a.ep || !writer) {
+    GTEST_SKIP() << prov << " is not available";
+  }
+  a.mem.assign(NW * gather_cycle_t::W, 0);
+  std::string err;
+  auto pool = WindowPool::create(*a.ep, a.mem.data(), gather_cycle_t::W, NW,
+				 &err);
+  ASSERT_TRUE(pool) << err;
+  gather_cycle_t g{*pool, *a.ep, *writer};
+  g.run(T, ROUNDS, BUDGET);
+  EXPECT_EQ(0, g.wrong.load());
+  EXPECT_EQ(0, g.stray.load());
+  EXPECT_EQ(0, g.failed.load()) << g.first_rc << ": " << writer->last_error();
+  EXPECT_EQ(0, g.exhausted.load());  // more windows than gathers
+  EXPECT_EQ(int(T * ROUNDS), g.taken.load());
+  EXPECT_EQ(T * ROUNDS, pool->stats().rekeyed);
+}
+
+TEST(OfiGatherCycle, CutOffsAlongside)
+{
+  // the same, with the pusher's writes into a stalled owner cut off
+  // alongside the gathers, by cancelling them one by one and then by
+  // resetting the endpoint: a reset takes the gathers' pushes in flight
+  // with it, and their windows come back unclean. A window is lent again
+  // under a new key, so nothing of a push that failed may land in it.
+  for (bool per_plan : {true, false}) {
+    SCOPED_TRACE(per_plan ? "per-plan cut-off" : "reset");
+    stalled_t t;
+    if (!t.open(nullptr, [per_plan](config_t& c) {
+	  c.stage_count = 16;
+	  if (per_plan) {
+	    c.cancel_hook = [] { return 0; };
+	  }
+	})) {
+      GTEST_SKIP() << "tcp is not available";
+    }
+    window_owner_t a;
+    a.ep = open_target("tcp", "127.0.0.1");
+    ASSERT_TRUE(a.ep);
+    constexpr size_t T = 4, NW = 6, ROUNDS = 150;
+    a.mem.assign(NW * gather_cycle_t::W, 0);
+    std::string err;
+    auto pool = WindowPool::create(*a.ep, a.mem.data(), gather_cycle_t::W,
+				   NW, &err);
+    ASSERT_TRUE(pool) << err;
+    gather_cycle_t g{*pool, *a.ep, *t.writer};
+    std::atomic<bool> cut_done{false};
+    int cut = 0;
+    std::thread cutter([&] {
+      // short budgets into the stalled owner, while the gathers go on:
+      // each ends in a cut-off
+      for (int i = 0; i < 4; i++) {
+	if (t.write(i % 4, ms(600)) == -ETIMEDOUT) {
+	  cut++;
+	}
+	if (!per_plan) {
+	  t.connect();  // the reset dropped the connection
+	}
+      }
+      cut_done = true;
+    });
+    g.run(T, ROUNDS, BUDGET, &cut_done);
+    cutter.join();
+    EXPECT_GT(cut, 0);
+    EXPECT_EQ(0, g.wrong.load());
+    EXPECT_EQ(0, g.stray.load());
+    EXPECT_GT(g.taken.load(), int(T * ROUNDS / 2));
+    const auto st = t.writer->stats();
+    EXPECT_EQ(0u, st.budget_refused);
+    if (per_plan) {
+      EXPECT_EQ(4u, st.plans_cut_off);
+      EXPECT_EQ(0, g.failed.load()) << g.first_rc;
+      EXPECT_EQ(0u, st.resets);
+    } else {
+      EXPECT_EQ(4u, st.resets);
+    }
+  }
+}
+
+namespace {
+
 /// n window owners on tcp, and a writer with the given limits whose
 /// inserts go through gate
 struct many_t {
