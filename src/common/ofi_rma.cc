@@ -1451,9 +1451,92 @@ std::string Endpoint::last_error() const
   return impl->get_err();
 }
 
+std::chrono::milliseconds Endpoint::key_quarantine() const
+{
+  return impl->cfg.key_quarantine;
+}
+
 bool Endpoint::unsafe() const
 {
   return impl->unsafe;
+}
+
+std::unique_ptr<WindowPool> WindowPool::create(Endpoint& ep, char* mem,
+					       size_t size, size_t count,
+					       std::string* err)
+{
+  std::unique_ptr<WindowPool> p(new WindowPool(ep, size));
+  p->slots.resize(count);
+  for (size_t i = 0; i < count; i++) {
+    if (int r = ep.register_window(mem + i * size, size, &p->slots[i].w); r < 0) {
+      *err = "registering window " + std::to_string(i) + ": " + ep.last_error();
+      p->slots.resize(i);
+      return nullptr;
+    }
+  }
+  return p;
+}
+
+WindowPool::~WindowPool()
+{
+  for (auto& s : slots) {
+    ep.deregister_window(s.w.id);
+  }
+}
+
+std::optional<WindowPool::lent_t> WindowPool::acquire(size_t size)
+{
+  if (size > slot_size) {
+    return std::nullopt;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard l(mtx);
+  for (size_t i = 0; i < slots.size(); i++) {
+    auto& s = slots[i];
+    if (s.in_use || now < s.quarantined_until) {
+      continue;
+    }
+    std::string token = ep.window_token(s.w, 0, slot_size);
+    if (token.empty()) {
+      return std::nullopt;  // the endpoint lends no more
+    }
+    s.in_use = true;
+    st.acquired++;
+    return lent_t{i, s.w.ptr, slot_size, std::move(token)};
+  }
+  st.exhausted++;
+  return std::nullopt;
+}
+
+void WindowPool::release(uint64_t id, std::chrono::milliseconds quarantine,
+			 bool rekey)
+{
+  std::lock_guard l(mtx);
+  if (id >= slots.size()) {
+    return;
+  }
+  auto& s = slots[id];
+  s.in_use = false;
+  if (rekey) {
+    if (ep.rekey_window(s.w) == 0) {
+      // nothing meant for the last operation can land any more
+      st.rekeyed++;
+      s.quarantined_until = {};
+      return;
+    }
+    // writes with the old key may land until it has left the network
+    st.rekey_failed++;
+    quarantine = std::max(quarantine, ep.key_quarantine());
+  }
+  if (quarantine.count() > 0) {
+    s.quarantined_until = std::chrono::steady_clock::now() + quarantine;
+  }
+}
+
+WindowPool::stats_t WindowPool::stats() const
+{
+  std::lock_guard l(mtx);
+  return st;
 }
 
 } // namespace ceph::ofi

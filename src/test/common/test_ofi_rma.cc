@@ -843,6 +843,63 @@ INSTANTIATE_TEST_SUITE_P(
 		    std::make_pair("shm", "")),
   [](const auto& info) { return std::string(info.param.first); });
 
+TEST_P(OfiRekey, WindowPoolRekeysOnRelease)
+{
+  // a pool of windows lent and reused, as an OSD's gather windows are: a
+  // window released with rekey comes back under a new key, and a write
+  // meant for its last use fails instead of landing in the next one
+  auto [prov, node] = GetParam();
+  auto gate = std::make_shared<gate_t>();
+  window_owner_t a;
+  a.ep = open_target(prov, node);
+  auto writer = open_writer(prov, node, true, 256 << 10, 2, gate);
+  if (!a.ep || !writer) {
+    GTEST_SKIP() << prov << " is not available";
+  }
+  const size_t W = 256 << 10;
+  a.mem.assign(2 * W, 0);
+  std::string err;
+  auto pool = WindowPool::create(*a.ep, a.mem.data(), W, 2, &err);
+  ASSERT_TRUE(pool) << err;
+  std::vector<char> src(W, 'g'), late(W, 'L');
+  iovec iov{src.data(), W}, liov{late.data(), W};
+  std::vector<Endpoint::write_t> all = {{0, W, 0}};
+
+  auto first = pool->acquire(W);
+  ASSERT_TRUE(first);
+  auto t1 = parse_token(first->token);
+  ASSERT_TRUE(t1);
+  ASSERT_EQ(0, writer->write(*t1, &iov, 1, all, BUDGET)) << writer->last_error();
+  pool->release(first->id, ms(0), true);
+  EXPECT_EQ(1u, pool->stats().rekeyed);
+
+  // both windows are free, and the released one is lent again at once
+  auto second = pool->acquire(W);
+  ASSERT_TRUE(second);
+  EXPECT_EQ(first->id, second->id);
+  auto t2 = parse_token(second->token);
+  ASSERT_TRUE(t2);
+  EXPECT_NE(t1->key, t2->key);
+  a.ep->sync();
+  std::fill(second->ptr, second->ptr + W, 'n');
+  EXPECT_NE(0, writer->write(*t1, &liov, 1, all, BUDGET));
+  a.ep->sync();
+  EXPECT_EQ(std::string::npos, std::string_view(second->ptr, W).find('L'));
+
+  // without rekey the key stays, and a quarantine keeps the window out
+  pool->release(second->id, ms(0), false);
+  auto third = pool->acquire(W);
+  ASSERT_TRUE(third);
+  EXPECT_EQ(t2->key, parse_token(third->token)->key);
+  pool->release(third->id, ms(60000), false);
+  auto fourth = pool->acquire(W);
+  ASSERT_TRUE(fourth);
+  EXPECT_NE(third->id, fourth->id);
+  EXPECT_FALSE(pool->acquire(W));  // both out: one lent, one quarantined
+  EXPECT_EQ(1u, pool->stats().exhausted);
+  EXPECT_FALSE(pool->acquire(W + 1));  // too large for any window
+}
+
 TEST(OfiLateStart, DoesNotCutOffOthers)
 {
   // A write that reaches the point of posting with its budget nearly

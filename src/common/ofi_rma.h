@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -244,11 +245,73 @@ public:
   /// a cut-off failed or ended late (see write()); the endpoint takes no
   /// more writes, and writes it took may still land
   bool unsafe() const;
+  /// config_t::key_quarantine
+  std::chrono::milliseconds key_quarantine() const;
 
   struct Impl;
 private:
   explicit Endpoint(std::unique_ptr<Impl> impl);
   std::unique_ptr<Impl> impl;
+};
+
+/**
+ * Windows of one size that peers write into, lent for one operation at a
+ * time and then reused, as an OSD's gather windows are. Each window has a
+ * key of its own. On release a window can get a new one, so that no write
+ * meant for an earlier operation lands in a later one: not a peer's that
+ * missed its operation, and not a provider's late duplicate of one that
+ * completed. A window that could not get a new key, or is released with
+ * a quarantine, stays out of use that long.
+ */
+class WindowPool {
+public:
+  /// count windows of size bytes each, at mem; on failure, returns null
+  /// and sets *err
+  static std::unique_ptr<WindowPool> create(Endpoint& ep, char* mem,
+					    size_t size, size_t count,
+					    std::string* err);
+  ~WindowPool();
+
+  struct lent_t {
+    uint64_t id = 0;
+    char* ptr = nullptr;
+    size_t size = 0;
+    std::string token;  ///< for the whole window
+  };
+  /// a free window of at least size bytes, or nullopt
+  std::optional<lent_t> acquire(size_t size);
+  /**
+   * Return a window. rekey gives it a new key first, after which no write
+   * meant for its last operation can land: it is free at once. Without
+   * rekey, or when the new key fails, it stays out of use for quarantine,
+   * and for the endpoint's key_quarantine at least when the new key
+   * failed. Call it only when no write of the operation is still
+   * expected.
+   */
+  void release(uint64_t id, std::chrono::milliseconds quarantine, bool rekey);
+
+  struct stats_t {
+    uint64_t acquired = 0;
+    uint64_t exhausted = 0;
+    uint64_t rekeyed = 0;
+    uint64_t rekey_failed = 0;
+  };
+  stats_t stats() const;
+  size_t count() const { return slots.size(); }
+  size_t size() const { return slot_size; }
+
+private:
+  WindowPool(Endpoint& ep, size_t size) : ep(ep), slot_size(size) {}
+  struct slot_t {
+    Endpoint::window_t w;
+    bool in_use = false;
+    std::chrono::steady_clock::time_point quarantined_until{};
+  };
+  Endpoint& ep;
+  const size_t slot_size;
+  mutable std::mutex mtx;
+  std::vector<slot_t> slots;
+  stats_t st;
 };
 
 } // namespace ceph::ofi
