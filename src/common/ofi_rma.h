@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -70,6 +71,14 @@ struct config_t {
   /// endpoint that lends windows needs this unless the application
   /// polls.
   bool progress_thread = false;
+  /// ask for a thread-safe domain (FI_THREAD_SAFE), so that adding a new
+  /// peer to the address vector, which can be slow, holds up no other
+  /// write. A provider that offers only FI_THREAD_DOMAIN still works:
+  /// see write(). False asks for FI_THREAD_DOMAIN outright.
+  bool thread_safe = true;
+  /// for tests: runs on the insert thread just before each
+  /// fi_av_insert(), with the peer's name, under the same locks
+  std::function<void(const std::string&)> insert_hook;
 };
 
 class Endpoint {
@@ -126,6 +135,18 @@ public:
    * endpoint stops waiting early by the measured cost of a cut-off.
    * Windows stay registered across a cut-off, but the endpoint's name
    * can change with it, so a token issued before it can stop working.
+   *
+   * The first write to a peer adds it to the address vector. Some
+   * providers take long for that: the UET reference provider pings the
+   * peer, for up to 10 seconds. A thread of the endpoint's own does the
+   * insert, and writes to the same peer wait for it, each only until
+   * its own budget runs out (-ETIMEDOUT, with nothing sent). The insert
+   * goes on, so a later write finds the peer ready. On a thread-safe
+   * domain, writes to other peers go on meanwhile. A provider that
+   * offers only FI_THREAD_DOMAIN allows no other call during the
+   * insert: the insert waits until the writes in flight are done, so
+   * none of them misses its cut-off, and writes that start meanwhile
+   * wait for it, again only within their budgets.
    */
   int write(const token_t& dst, const struct iovec* iov, size_t iovcnt,
 	    const std::vector<write_t>& writes,
@@ -145,6 +166,9 @@ public:
     uint64_t staging_busy = 0;
     uint64_t timeouts = 0;
     uint64_t resets = 0;  ///< cut-offs: endpoint closed and reopened
+    /// writes that gave up before sending anything: their peer's
+    /// address insert, or the endpoint, did not get ready in the budget
+    uint64_t peer_timeouts = 0;
     uint64_t windows = 0;
   };
   stats_t stats() const;

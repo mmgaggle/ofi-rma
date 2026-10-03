@@ -5,7 +5,11 @@
 
 #include <cerrno>
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
+#include <iostream>
+#include <map>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -216,6 +220,308 @@ TEST(OfiWriteCutOff, Tcp)
   healthy->sync();
   EXPECT_EQ(0, memcmp(w2.data(), src.data(), N));
 }
+
+namespace {
+
+using clk = std::chrono::steady_clock;
+using ms = std::chrono::milliseconds;
+
+/// An insert hook that counts inserts per peer and can hold one peer's
+/// insert, as a provider that resolves the peer slowly would, until the
+/// test releases it.
+struct gate_t {
+  std::mutex m;
+  std::condition_variable cv;
+  std::string hold;
+  bool open = false;
+  std::map<std::string, int> calls;
+  clk::time_point held_at{};
+
+  void enter(const std::string& name) {
+    std::unique_lock l(m);
+    calls[name]++;
+    if (name == hold) {
+      held_at = clk::now();
+      cv.notify_all();
+      cv.wait(l, [this] { return open; });
+    }
+  }
+  /// wait until the held peer's insert has started
+  bool wait_held(ms timeout) {
+    std::unique_lock l(m);
+    return cv.wait_for(l, timeout, [this] { return calls[hold] > 0; });
+  }
+  void release() {
+    {
+      std::lock_guard l(m);
+      open = true;
+    }
+    cv.notify_all();
+  }
+  int count(const std::string& name) {
+    std::lock_guard l(m);
+    return calls[name];
+  }
+};
+
+std::unique_ptr<Endpoint> open_target(const std::string& prov,
+				      const std::string& node,
+				      bool progress = true)
+{
+  config_t c;
+  c.provider = prov;
+  c.node = node;
+  c.progress_thread = progress;
+  std::string err;
+  auto ep = Endpoint::open(c, &err);
+  if (!ep) {
+    std::cerr << prov << ": " << err << std::endl;
+  }
+  return ep;
+}
+
+std::unique_ptr<Endpoint> open_writer(const std::string& prov,
+				      const std::string& node,
+				      bool thread_safe, size_t stage_size,
+				      size_t stage_count,
+				      std::shared_ptr<gate_t> gate)
+{
+  config_t c;
+  c.provider = prov;
+  c.node = node;
+  c.thread_safe = thread_safe;
+  c.stage_size = stage_size;
+  c.stage_count = stage_count;
+  c.insert_hook = [gate](const std::string& name) { gate->enter(name); };
+  std::string err;
+  auto ep = Endpoint::open(c, &err);
+  if (!ep) {
+    std::cerr << prov << ": " << err << std::endl;
+  }
+  return ep;
+}
+
+struct window_owner_t {
+  // the memory first, so that it outlives the endpoint lending it
+  std::vector<char> mem;
+  std::unique_ptr<Endpoint> ep;
+  token_t tok;
+};
+
+bool lend(window_owner_t& o, size_t n)
+{
+  o.mem.assign(n, 0);
+  Endpoint::window_t w;
+  if (o.ep->register_window(o.mem.data(), n, &w) != 0) {
+    return false;
+  }
+  auto t = parse_token(o.ep->window_token(w, 0, n));
+  if (!t) {
+    return false;
+  }
+  o.tok = *t;
+  return true;
+}
+
+class OfiPeerInsert : public ::testing::TestWithParam<std::pair<const char*, const char*>> {};
+
+} // anonymous namespace
+
+TEST_P(OfiPeerInsert, SlowInsertHoldsUpNoOtherPeer)
+{
+  // the first write to peer A waits in a slow address insert; writes to
+  // peer B, already known, must go on meanwhile, and further writes to A
+  // must share A's insert and give up at their own budgets
+  auto [prov, node] = GetParam();
+  auto gate = std::make_shared<gate_t>();
+  window_owner_t a, b;
+  a.ep = open_target(prov, node);
+  b.ep = open_target(prov, node);
+  auto writer = open_writer(prov, node, true, 1 << 20, 4, gate);
+  if (!a.ep || !b.ep || !writer) {
+    GTEST_SKIP() << prov << " is not available";
+  }
+  if (writer->describe().find("concurrent peer inserts") == std::string::npos) {
+    GTEST_SKIP() << prov << " offers no thread-safe domain: "
+		 << writer->describe();
+  }
+  const size_t N = 1 << 20;
+  ASSERT_TRUE(lend(a, N));
+  ASSERT_TRUE(lend(b, N));
+  gate->hold = a.tok.name;
+  std::vector<char> src(N);
+  for (size_t i = 0; i < N; i++) {
+    src[i] = static_cast<char>(i * 13 + 5);
+  }
+  iovec iov{src.data(), N};
+  std::vector<Endpoint::write_t> all = {{0, N, 0}};
+
+  // B becomes a known peer
+  ASSERT_EQ(0, writer->write(b.tok, &iov, 1, all, BUDGET)) << writer->last_error();
+
+  // the first write to A, held in its insert
+  std::atomic<int> ra{1};
+  std::thread ta([&] { ra = writer->write(a.tok, &iov, 1, all, ms(20000)); });
+  ASSERT_TRUE(gate->wait_held(ms(5000)));
+
+  // B is not held up
+  auto t0 = clk::now();
+  ASSERT_EQ(0, writer->write(b.tok, &iov, 1, all, BUDGET)) << writer->last_error();
+  EXPECT_LT(clk::now() - t0, ms(1000));
+
+  // another write to A waits for the same insert, only within its budget
+  t0 = clk::now();
+  EXPECT_EQ(-ETIMEDOUT, writer->write(a.tok, &iov, 1, all, ms(400)));
+  const auto waited = clk::now() - t0;
+  EXPECT_GE(waited, ms(200));
+  EXPECT_LT(waited, ms(1000));
+  EXPECT_EQ(1u, writer->stats().peer_timeouts);
+  EXPECT_EQ(0u, writer->stats().resets);  // nothing was sent, nothing to cut off
+
+  // the insert finishes, and the first write to A with it
+  gate->release();
+  ta.join();
+  EXPECT_EQ(0, ra.load()) << writer->last_error();
+  a.ep->sync();
+  EXPECT_EQ(0, memcmp(a.mem.data(), src.data(), N));
+  EXPECT_EQ(1, gate->count(a.tok.name));
+  EXPECT_EQ(1, gate->count(b.tok.name));
+  EXPECT_EQ(2u, writer->stats().peers_inserted);
+
+  // no staging buffer leaked: every one of them still serves a write
+  for (int i = 0; i < 5; i++) {
+    ASSERT_EQ(0, writer->write(a.tok, &iov, 1, all, BUDGET)) << writer->last_error();
+  }
+  EXPECT_EQ(0u, writer->stats().staging_busy);
+}
+
+TEST_P(OfiPeerInsert, CoalescesFirstContact)
+{
+  // several writes reach a new peer at once: one insert serves them all
+  auto [prov, node] = GetParam();
+  auto gate = std::make_shared<gate_t>();
+  window_owner_t a;
+  a.ep = open_target(prov, node);
+  auto writer = open_writer(prov, node, true, 1 << 20, 4, gate);
+  if (!a.ep || !writer) {
+    GTEST_SKIP() << prov << " is not available";
+  }
+  const size_t N = 4 << 20;
+  ASSERT_TRUE(lend(a, N));
+  gate->hold = a.tok.name;
+  std::vector<char> src(N);
+  for (size_t i = 0; i < N; i++) {
+    src[i] = static_cast<char>(i * 31 + 1);
+  }
+  std::vector<std::thread> ts;
+  std::atomic<int> failed{0};
+  for (int i = 0; i < 4; i++) {
+    ts.emplace_back([&, i] {
+      const size_t q = N / 4;
+      iovec iov{src.data() + i * q, q};
+      std::vector<Endpoint::write_t> one = {{0, q, i * q}};
+      if (writer->write(a.tok, &iov, 1, one, ms(20000)) != 0) {
+	failed++;
+      }
+    });
+  }
+  ASSERT_TRUE(gate->wait_held(ms(5000)));
+  std::this_thread::sleep_for(ms(200));  // let every writer reach the wait
+  gate->release();
+  for (auto& t : ts) {
+    t.join();
+  }
+  EXPECT_EQ(0, failed.load()) << writer->last_error();
+  a.ep->sync();
+  EXPECT_EQ(0, memcmp(a.mem.data(), src.data(), N));
+  EXPECT_EQ(1, gate->count(a.tok.name));
+  EXPECT_EQ(1u, writer->stats().peers_inserted);
+}
+
+TEST(OfiPeerInsertDomain, Tcp)
+{
+  // FI_THREAD_DOMAIN: an insert stops the endpoint. It must wait for the
+  // write in flight to be cut off at its budget, and writes that start
+  // while it runs must give up at their budgets, not when it ends.
+  auto gate = std::make_shared<gate_t>();
+  window_owner_t a, b, s;
+  a.ep = open_target("tcp", "127.0.0.1");
+  b.ep = open_target("tcp", "127.0.0.1");
+  s.ep = open_target("tcp", "127.0.0.1", false);  // never polls
+  auto writer = open_writer("tcp", "127.0.0.1", false, 8 << 20, 2, gate);
+  if (!a.ep || !b.ep || !s.ep || !writer) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  EXPECT_NE(writer->describe().find("peer inserts pause writes"),
+	    std::string::npos) << writer->describe();
+  const size_t N = 8 << 20;
+  ASSERT_TRUE(lend(a, N));
+  ASSERT_TRUE(lend(b, N));
+  ASSERT_TRUE(lend(s, N));
+  gate->hold = a.tok.name;
+  std::vector<char> src(N, 'y');
+  iovec iov{src.data(), N};
+  std::vector<Endpoint::write_t> all = {{0, N, 0}};
+  std::vector<char> z(4096, 0);
+  iovec zv{z.data(), z.size()};
+  std::vector<Endpoint::write_t> one = {{0, z.size(), 0}};
+
+  // B known; S known and connected while it polls, then left stalled
+  ASSERT_EQ(0, writer->write(b.tok, &zv, 1, one, BUDGET)) << writer->last_error();
+  {
+    std::atomic<bool> stop{false};
+    std::thread poller([&] { while (!stop) s.ep->progress(); });
+    EXPECT_EQ(0, writer->write(s.tok, &zv, 1, one, BUDGET)) << writer->last_error();
+    stop = true;
+    poller.join();
+  }
+
+  // a write into S that cannot complete: it is in flight until cut off
+  std::atomic<int> rs{1};
+  clk::time_point s_end;
+  const auto s_start = clk::now();
+  std::thread tsw([&] {
+    rs = writer->write(s.tok, &iov, 1, all, ms(1000));
+    s_end = clk::now();
+  });
+  std::this_thread::sleep_for(ms(100));
+
+  // first contact with A while it is in flight
+  std::atomic<int> ra{1};
+  std::thread ta([&] { ra = writer->write(a.tok, &zv, 1, one, ms(20000)); });
+  ASSERT_TRUE(gate->wait_held(ms(5000)));
+  tsw.join();
+  EXPECT_EQ(-ETIMEDOUT, rs.load());
+  // cut off within its budget: the insert did not delay it
+  EXPECT_LT(s_end - s_start, ms(1000));
+  {
+    // the insert waited for it: it began at the cut-off, near the end of
+    // the budget, not when A's write arrived 100 ms in
+    std::lock_guard l(gate->m);
+    EXPECT_GE(gate->held_at - s_start, ms(700));
+  }
+
+  // while the insert holds the endpoint, a write to B gives up at its
+  // budget instead of waiting for the insert
+  const auto t0 = clk::now();
+  EXPECT_EQ(-ETIMEDOUT, writer->write(b.tok, &zv, 1, one, ms(400)));
+  EXPECT_LT(clk::now() - t0, ms(1000));
+  EXPECT_GE(writer->stats().peer_timeouts, 1u);
+
+  gate->release();
+  ta.join();
+  EXPECT_EQ(0, ra.load()) << writer->last_error();
+  EXPECT_EQ(0, writer->write(b.tok, &iov, 1, all, BUDGET)) << writer->last_error();
+  b.ep->sync();
+  EXPECT_EQ(0, memcmp(b.mem.data(), src.data(), N));
+  EXPECT_EQ(1, gate->count(a.tok.name));
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  Providers, OfiPeerInsert,
+  ::testing::Values(std::make_pair("tcp", "127.0.0.1"),
+		    std::make_pair("shm", "")),
+  [](const auto& info) { return std::string(info.param.first); });
 
 INSTANTIATE_TEST_SUITE_P(
   Providers, OfiWrite,

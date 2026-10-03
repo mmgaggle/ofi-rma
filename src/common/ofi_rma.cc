@@ -13,8 +13,10 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <list>
 #include <map>
 #include <mutex>
@@ -31,6 +33,9 @@ constexpr uint64_t MAX_WRITE = 8ull << 20;
 constexpr size_t MAX_NAME = 192;
 /// peers kept in the address vector before idle ones are dropped
 constexpr size_t MAX_PEERS = 1024;
+/// how long a failed address insert is remembered: writes to the peer
+/// fail at once until then, instead of queueing another slow insert
+constexpr std::chrono::seconds INSERT_RETRY{1};
 /// the API version asked for: old enough for a provider built against
 /// 1.x headers, new enough for FI_CONTEXT2 and the mr_mode bits used
 constexpr uint32_t API_VERSION = FI_VERSION(1, 18);
@@ -165,12 +170,19 @@ struct Endpoint::Impl {
   std::string my_name;
   uint64_t mr_mode = 0;
   bool dc = false;
+  /// the domain is FI_THREAD_SAFE: an address insert needs no lock
+  bool thread_safe = false;
   uint64_t max_write = MAX_WRITE;
   uint64_t next_key = 1;
 
-  /// every libfabric call on this endpoint runs under this lock
-  /// (FI_THREAD_DOMAIN), and so does every touch of the state below
-  mutable std::mutex mtx;
+  /// every libfabric call on this endpoint runs under this lock, except
+  /// an address insert on a thread-safe domain, and so does every touch
+  /// of the state below. Timed, so that a write waits for it only until
+  /// its deadline.
+  mutable std::timed_mutex mtx;
+  /// set while an insert on a FI_THREAD_DOMAIN domain waits for the
+  /// writes in flight to finish, and while it runs: no write starts
+  bool quiesce = false;
 
   struct region_t {
     fid_mr* mr = nullptr;
@@ -180,20 +192,35 @@ struct Endpoint::Impl {
     void* desc = nullptr;
   };
   std::map<uint64_t, region_t> windows;
+  std::atomic<uint64_t> nwindows{0};  ///< windows.size(), readable without mtx
   uint64_t next_window = 0;
 
   char* stage = nullptr;
   region_t stage_mr;
   std::vector<bool> stage_busy;
 
+  /// The address vector's peers. They have a lock of their own, so that
+  /// a write can wait for a peer's insert without mtx, which an insert
+  /// on a FI_THREAD_DOMAIN domain holds. Lock order: mtx, then peer_mtx.
+  enum class peer_state { pending, ready, failed };
   struct peer_t {
     /// the name, zero-padded so the provider never reads past it, and
     /// kept for the entry's life (some providers keep the pointer)
     std::string addr_buf;
     fi_addr_t addr = FI_ADDR_NOTAVAIL;
-    uint32_t inflight = 0;
+    peer_state state = peer_state::pending;
+    int err = 0;  ///< why the insert failed
+    std::chrono::steady_clock::time_point retry_at{};
+    /// writes that hold the address: from the lookup until they retire.
+    /// The entry is not dropped while any do.
+    uint32_t refs = 0;
   };
+  std::mutex peer_mtx;
+  std::condition_variable peer_cv;    ///< a pending insert finished
+  std::condition_variable insert_cv;  ///< insert_q has work
   std::map<std::string, peer_t> peers;
+  std::deque<std::string> insert_q;
+  std::thread insert_thr;
 
   struct plan_t;
   /// one posted write; the context must stay put until it completes
@@ -215,21 +242,33 @@ struct Endpoint::Impl {
   std::thread progress_thr;
   std::atomic<bool> stopping{false};
 
+  /// the provider's text for the latest failure; a lock of its own, so
+  /// that reading it never waits for an insert that holds mtx
+  mutable std::mutex err_mtx;
   std::string last_err;
+  void set_err(std::string e) {
+    std::lock_guard el(err_mtx);
+    last_err = std::move(e);
+  }
+  std::string get_err() const {
+    std::lock_guard el(err_mtx);
+    return last_err;
+  }
   std::atomic<uint64_t> writes_posted{0};
   std::atomic<uint64_t> writes_failed{0};
   std::atomic<uint64_t> bytes_written{0};
   std::atomic<uint64_t> peers_inserted{0};
   std::atomic<uint64_t> staging_busy{0};
   std::atomic<uint64_t> timeouts{0};
+  std::atomic<uint64_t> peer_timeouts{0};
 
   /// set when a cut-off could not reopen the endpoint; every write
   /// fails from then on
   bool broken = false;
   std::atomic<uint64_t> resets{0};
-  /// how long a cut-off takes, at most, as measured; a write stops
-  /// waiting this much before its budget runs out
-  std::chrono::milliseconds reset_cost{100};
+  /// how long a cut-off takes, at most, as measured, in milliseconds; a
+  /// write stops waiting this much before its budget runs out
+  std::atomic<int64_t> reset_cost_ms{100};
 
   ~Impl();
   /// open the completion queue and the endpoint, bind and enable them,
@@ -244,14 +283,37 @@ struct Endpoint::Impl {
   void poll_locked();
   void complete_locked(op_t* op, int err);
   void retire_locked(plan_t* p);
-  int peer_locked(const std::string& name, fi_addr_t* out);
+
+  using time_point = std::chrono::steady_clock::time_point;
+  /// the peer's address, waiting for its insert until deadline; takes a
+  /// reference, which put_peer() drops
+  int get_peer(const std::string& name, time_point deadline, fi_addr_t* out);
+  void put_peer(const std::string& name);
+  /// the insert thread: adds queued peers to the address vector
+  void insert_loop();
+  /// drop idle peers when the address vector is full; under peer_mtx,
+  /// and under mtx too unless the domain is thread-safe
+  void evict_locked();
+  /// take mtx for a write, unless the deadline passes first or an
+  /// insert on a FI_THREAD_DOMAIN domain keeps the endpoint quiet
+  bool lock_for_write(std::unique_lock<std::timed_mutex>& l,
+		      time_point deadline);
 };
 
 Endpoint::Impl::~Impl()
 {
-  stopping = true;
+  {
+    std::lock_guard pl(peer_mtx);
+    stopping = true;
+  }
+  insert_cv.notify_all();
+  peer_cv.notify_all();
   if (progress_thr.joinable()) {
     progress_thr.join();
+  }
+  // waits for an insert still inside the provider
+  if (insert_thr.joinable()) {
+    insert_thr.join();
   }
   // the endpoint first: it cancels whatever an abandoned plan still has
   // in flight, after which no write references the regions
@@ -274,7 +336,7 @@ int Endpoint::Impl::reg(char* ptr, size_t len, uint64_t access, region_t* out)
   fid_mr* mr = nullptr;
   int r = fi_mr_reg(domain, ptr, len, access, 0, req_key, 0, &mr, nullptr);
   if (r) {
-    last_err = "fi_mr_reg: " + fi_err(r);
+    set_err("fi_mr_reg: " + fi_err(r));
     return to_errno(r);
   }
   if (mr_mode & FI_MR_ENDPOINT) {
@@ -283,14 +345,14 @@ int Endpoint::Impl::reg(char* ptr, size_t len, uint64_t access, region_t* out)
       r = fi_mr_enable(mr);
     }
     if (r) {
-      last_err = "binding a region to the endpoint: " + fi_err(r);
+      set_err("binding a region to the endpoint: " + fi_err(r));
       fi_close(&mr->fid);
       return to_errno(r);
     }
   }
   const uint64_t key = fi_mr_key(mr);
   if ((access & FI_REMOTE_WRITE) && key == FI_KEY_NOTAVAIL) {
-    last_err = "the provider gave the region no key";
+    set_err("the provider gave the region no key");
     fi_close(&mr->fid);
     return -EOPNOTSUPP;
   }
@@ -301,9 +363,7 @@ int Endpoint::Impl::reg(char* ptr, size_t len, uint64_t access, region_t* out)
 void Endpoint::Impl::retire_locked(plan_t* p)
 {
   stage_busy[p->slot] = false;
-  if (auto it = peers.find(p->peer); it != peers.end() && it->second.inflight) {
-    it->second.inflight--;
-  }
+  put_peer(p->peer);
   plans.erase(p->self);
 }
 
@@ -351,7 +411,7 @@ void Endpoint::Impl::poll_locked()
       }
       const char* text = fi_cq_strerror(cq, e.prov_errno, e.err_data,
 					nullptr, 0);
-      last_err = fi_err(e.err) + (text ? std::string(" (") + text + ")" : "");
+      set_err(fi_err(e.err) + (text ? std::string(" (") + text + ")" : ""));
       if (e.op_context) {
 	complete_locked(static_cast<op_t*>(e.op_context),
 			e.err ? to_errno(e.err) : -EIO);
@@ -362,35 +422,156 @@ void Endpoint::Impl::poll_locked()
   }
 }
 
-int Endpoint::Impl::peer_locked(const std::string& name, fi_addr_t* out)
+int Endpoint::Impl::get_peer(const std::string& name, time_point deadline,
+			     fi_addr_t* out)
 {
-  if (auto it = peers.find(name); it != peers.end()) {
-    *out = it->second.addr;
-    return 0;
+  std::unique_lock pl(peer_mtx);
+  if (stopping) {
+    return -ESHUTDOWN;
   }
-  if (peers.size() >= MAX_PEERS) {
-    for (auto it = peers.begin(); it != peers.end(); ) {
-      if (it->second.inflight == 0) {
-	fi_av_remove(av, &it->second.addr, 1, 0);
-	it = peers.erase(it);
-      } else {
-	++it;
-      }
-    }
+  auto [it, fresh] = peers.try_emplace(name);
+  peer_t& p = it->second;
+  const auto now = std::chrono::steady_clock::now();
+  if (fresh) {
+    p.addr_buf.assign(std::max(name.size(), MAX_NAME), '\0');
+    std::memcpy(p.addr_buf.data(), name.data(), name.size());
   }
-  auto [it, inserted] = peers.emplace(name, peer_t{});
-  auto& p = it->second;
-  p.addr_buf.assign(std::max(name.size(), MAX_NAME), '\0');
-  std::memcpy(p.addr_buf.data(), name.data(), name.size());
-  const int r = fi_av_insert(av, p.addr_buf.data(), 1, &p.addr, 0, nullptr);
-  if (r != 1) {
-    last_err = "fi_av_insert: " + (r < 0 ? fi_err(r) : std::string("rejected"));
-    peers.erase(it);
-    return r < 0 ? to_errno(r) : -EHOSTUNREACH;
+  if (fresh || (p.state == peer_state::failed && now >= p.retry_at)) {
+    p.state = peer_state::pending;
+    p.err = 0;
+    insert_q.push_back(name);
+    insert_cv.notify_one();
   }
-  peers_inserted++;
+  // the reference keeps the entry while this write waits on it
+  p.refs++;
+  const bool settled = peer_cv.wait_until(pl, deadline, [&] {
+    return p.state != peer_state::pending || stopping;
+  });
+  if (!settled) {
+    p.refs--;
+    return -ETIMEDOUT;
+  }
+  if (p.state != peer_state::ready) {
+    p.refs--;
+    return p.state == peer_state::failed ? p.err : -ESHUTDOWN;
+  }
   *out = p.addr;
   return 0;
+}
+
+void Endpoint::Impl::put_peer(const std::string& name)
+{
+  std::lock_guard pl(peer_mtx);
+  if (auto it = peers.find(name); it != peers.end() && it->second.refs) {
+    it->second.refs--;
+  }
+}
+
+void Endpoint::Impl::evict_locked()
+{
+  if (peers.size() <= MAX_PEERS) {
+    return;
+  }
+  for (auto it = peers.begin(); it != peers.end(); ) {
+    peer_t& p = it->second;
+    if (p.refs == 0 && p.state != peer_state::pending) {
+      if (p.state == peer_state::ready) {
+	fi_av_remove(av, &p.addr, 1, 0);
+      }
+      it = peers.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+void Endpoint::Impl::insert_loop()
+{
+  while (true) {
+    std::string name;
+    char* addr_buf;
+    {
+      std::unique_lock pl(peer_mtx);
+      insert_cv.wait(pl, [this] { return stopping || !insert_q.empty(); });
+      if (stopping) {
+	return;
+      }
+      name = std::move(insert_q.front());
+      insert_q.pop_front();
+      // a pending entry is never dropped, so its buffer stays put
+      addr_buf = peers.at(name).addr_buf.data();
+    }
+    std::unique_lock l(mtx, std::defer_lock);
+    if (!thread_safe) {
+      // FI_THREAD_DOMAIN: no other call on the domain may run during the
+      // insert, and the insert can take seconds. Let the writes in flight
+      // finish first, within their budgets, so that the insert delays
+      // none of their cut-offs; writes that start meanwhile wait.
+      l.lock();
+      quiesce = true;
+      while (!plans.empty() && !stopping) {
+	l.unlock();
+	std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	l.lock();
+      }
+    }
+    fi_addr_t addr = FI_ADDR_NOTAVAIL;
+    int r = -FI_ESHUTDOWN;
+    if (!stopping) {
+      {
+	std::lock_guard pl(peer_mtx);
+	evict_locked();
+      }
+      if (cfg.insert_hook) {
+	cfg.insert_hook(name);
+      }
+      r = fi_av_insert(av, addr_buf, 1, &addr, 0, nullptr);
+    }
+    if (r != 1) {
+      set_err("fi_av_insert: " + (r < 0 ? fi_err(r) : std::string("rejected")));
+    }
+    {
+      // under mtx too on a FI_THREAD_DOMAIN domain: writes start again
+      // only once the peer is settled
+      std::lock_guard pl(peer_mtx);
+      peer_t& p = peers.at(name);
+      if (r == 1) {
+	p.addr = addr;
+	p.state = peer_state::ready;
+	peers_inserted++;
+      } else {
+	p.state = peer_state::failed;
+	p.err = r < 0 ? to_errno(r) : -EHOSTUNREACH;
+	p.retry_at = std::chrono::steady_clock::now() + INSERT_RETRY;
+      }
+    }
+    if (l.owns_lock()) {
+      quiesce = false;
+      l.unlock();
+    }
+    peer_cv.notify_all();
+  }
+}
+
+bool Endpoint::Impl::lock_for_write(std::unique_lock<std::timed_mutex>& l,
+				    time_point deadline)
+{
+  while (true) {
+    if (!l.try_lock_until(deadline)) {
+      return false;
+    }
+    if (!quiesce) {
+      return true;
+    }
+    l.unlock();
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      return false;
+    }
+    std::this_thread::sleep_for(
+      std::min<std::chrono::steady_clock::duration>(
+	std::chrono::milliseconds(1), deadline - now));
+  }
 }
 
 int Endpoint::Impl::open_ep(std::string* err)
@@ -447,9 +628,13 @@ void Endpoint::Impl::reset_locked()
     fi_close(&cq->fid);
     cq = nullptr;
   }
-  // every plan still waiting has lost its writes
+  // every plan still waiting has lost its writes; one that posted none
+  // yet (its writer is gathering the source) has lost nothing
   for (auto it = plans.begin(); it != plans.end(); ) {
     plan_t* p = (it++)->get();
+    if (p->ops.empty()) {
+      continue;
+    }
     p->outstanding = 0;
     if (!p->err) {
       p->err = -ECANCELED;
@@ -473,7 +658,7 @@ void Endpoint::Impl::reset_locked()
   std::string err;
   if (open_ep(&err) < 0) {
     broken = true;
-    last_err = "reopening after a cut-off: " + err;
+    set_err("reopening after a cut-off: " + err);
     return;
   }
   if (rebind) {
@@ -496,7 +681,7 @@ void Endpoint::Impl::reset_locked()
   }
   const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
     std::chrono::steady_clock::now() - t0);
-  reset_cost = std::max(reset_cost, took + std::chrono::milliseconds(50));
+  reset_cost_ms = std::max<int64_t>(reset_cost_ms, took.count() + 50);
 }
 
 Endpoint::Endpoint(std::unique_ptr<Impl> i) : impl(std::move(i)) {}
@@ -521,7 +706,6 @@ std::unique_ptr<Endpoint> Endpoint::open(const config_t& cfg, std::string* err)
   hints->mode = FI_CONTEXT | FI_CONTEXT2;
   hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_VIRT_ADDR |
     FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_ENDPOINT;
-  hints->domain_attr->threading = FI_THREAD_DOMAIN;
   hints->fabric_attr->prov_name = strdup(cfg.provider.c_str());
   if (!cfg.domain.empty()) {
     hints->domain_attr->name = strdup(cfg.domain.c_str());
@@ -529,14 +713,27 @@ std::unique_ptr<Endpoint> Endpoint::open(const config_t& cfg, std::string* err)
   const char* node = cfg.node.empty() ? nullptr : cfg.node.c_str();
   const char* service = cfg.service.empty() ? nullptr : cfg.service.c_str();
   const uint64_t flags = (node || service) ? FI_SOURCE : 0;
-  // ask for completions that mean "placed in the target's memory"; a
+  // Ask for completions that mean "placed in the target's memory"; a
   // provider that cannot promise it is still usable, see
-  // delivery_complete()
-  hints->tx_attr->op_flags = FI_DELIVERY_COMPLETE;
-  int r = fi_getinfo(API_VERSION, node, service, flags, hints, &d->info);
-  if (r == -FI_ENODATA) {
-    hints->tx_attr->op_flags = 0;
-    r = fi_getinfo(API_VERSION, node, service, flags, hints, &d->info);
+  // delivery_complete(). Ask for a thread-safe domain too, so that a slow
+  // address insert holds up no other write; that matters less, so a
+  // provider without one is preferred to giving up delivery-complete.
+  int r = -FI_ENODATA;
+  for (uint64_t op_flags : {uint64_t{FI_DELIVERY_COMPLETE}, uint64_t{0}}) {
+    for (fi_threading threading : {FI_THREAD_SAFE, FI_THREAD_DOMAIN}) {
+      if (threading == FI_THREAD_SAFE && !cfg.thread_safe) {
+	continue;
+      }
+      hints->tx_attr->op_flags = op_flags;
+      hints->domain_attr->threading = threading;
+      r = fi_getinfo(API_VERSION, node, service, flags, hints, &d->info);
+      if (r != -FI_ENODATA) {
+	break;
+      }
+    }
+    if (r != -FI_ENODATA) {
+      break;
+    }
   }
   fi_freeinfo(hints);
   if (r) {
@@ -548,6 +745,7 @@ std::unique_ptr<Endpoint> Endpoint::open(const config_t& cfg, std::string* err)
   d->prov = info->fabric_attr->prov_name ? info->fabric_attr->prov_name : "";
   d->mr_mode = info->domain_attr->mr_mode;
   d->dc = info->tx_attr->op_flags & FI_DELIVERY_COMPLETE;
+  d->thread_safe = info->domain_attr->threading == FI_THREAD_SAFE;
   if (info->ep_attr->max_msg_size) {
     d->max_write = std::min<uint64_t>(MAX_WRITE, info->ep_attr->max_msg_size);
   }
@@ -585,10 +783,13 @@ std::unique_ptr<Endpoint> Endpoint::open(const config_t& cfg, std::string* err)
     }
     d->stage = static_cast<char*>(p);
     if ((r = d->reg(d->stage, total, FI_WRITE, &d->stage_mr))) {
-      *err = "registering staging: " + d->last_err;
+      *err = "registering staging: " + d->get_err();
       return nullptr;
     }
     d->stage_busy.assign(cfg.stage_count, false);
+    // a writer adds peers to the address vector on a thread of its own
+    Impl* raw = d.get();
+    d->insert_thr = std::thread([raw] { raw->insert_loop(); });
   }
 
   if (cfg.progress_thread) {
@@ -634,6 +835,10 @@ std::string Endpoint::describe() const
   s += (impl->mr_mode & FI_MR_VIRT_ADDR) ? ", virtual-address regions" :
     ", offset regions";
   s += impl->dc ? ", delivery-complete writes" : ", transmit-complete writes";
+  if (impl->stage) {
+    s += impl->thread_safe ? ", concurrent peer inserts" :
+      ", peer inserts pause writes";
+  }
   return s;
 }
 
@@ -647,6 +852,7 @@ int Endpoint::register_window(char* ptr, size_t len, window_t* out)
   }
   const uint64_t id = d.next_window++;
   d.windows[id] = reg;
+  d.nwindows = d.windows.size();
   *out = window_t{id, ptr, len};
   return 0;
 }
@@ -661,6 +867,7 @@ void Endpoint::deregister_window(uint64_t id)
   }
   fi_close(&it->second.mr->fid);
   d.windows.erase(it);
+  d.nwindows = d.windows.size();
 }
 
 std::string Endpoint::window_token(const window_t& w, uint64_t ofs,
@@ -708,25 +915,55 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
   if (total > d.cfg.stage_size) {
     return -E2BIG;
   }
-  std::unique_lock l(d.mtx);
-  if (d.broken || !d.ep) {
-    return -EIO;
-  }
   // stop waiting early enough to cut the writes off within the budget
-  if (budget <= d.reset_cost) {
+  const std::chrono::milliseconds reset_cost{d.reset_cost_ms.load()};
+  if (budget <= reset_cost) {
     return -ETIMEDOUT;
   }
   const auto deadline = std::chrono::steady_clock::now() + budget -
-    d.reset_cost;
+    reset_cost;
+  // the peer's address first, without the endpoint lock: the insert of a
+  // new peer can take seconds
+  fi_addr_t addr;
+  if (int r = d.get_peer(dst.name, deadline, &addr); r < 0) {
+    if (r == -ETIMEDOUT) {
+      d.peer_timeouts++;
+    }
+    return r;
+  }
+  std::unique_lock l(d.mtx, std::defer_lock);
+  if (!d.lock_for_write(l, deadline)) {
+    d.put_peer(dst.name);
+    d.peer_timeouts++;
+    return -ETIMEDOUT;
+  }
+  if (d.broken || !d.ep) {
+    d.put_peer(dst.name);
+    return -EIO;
+  }
   size_t slot = 0;
   while (slot < d.stage_busy.size() && d.stage_busy[slot]) {
     slot++;
   }
   if (slot == d.stage_busy.size()) {
     d.staging_busy++;
+    d.put_peer(dst.name);
     return -EBUSY;
   }
+  // the plan holds the slot and the peer reference from here on; being
+  // listed, it also keeps a FI_THREAD_DOMAIN insert from starting
+  d.stage_busy[slot] = true;
+  d.plans.push_front(std::make_unique<Impl::plan_t>());
+  Impl::plan_t* plan = d.plans.front().get();
+  plan->self = d.plans.begin();
+  plan->slot = slot;
+  plan->peer = dst.name;
+  plan->ops.reserve(chunks);
+
+  // gather the source into the slot without the lock: it can be
+  // megabytes, and the slot is ours alone
   char* buf = d.stage + slot * d.cfg.stage_size;
+  l.unlock();
   {
     char* p = buf;
     for (size_t i = 0; i < iovcnt; i++) {
@@ -734,18 +971,12 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
       p += iov[i].iov_len;
     }
   }
-  fi_addr_t addr;
-  if (int r = d.peer_locked(dst.name, &addr); r < 0) {
-    return r;
+  l.lock();
+  if (d.broken || !d.ep) {
+    // a cut-off failed to reopen the endpoint while we copied
+    d.retire_locked(plan);
+    return -EIO;
   }
-  d.stage_busy[slot] = true;
-  d.peers[dst.name].inflight++;
-  d.plans.push_front(std::make_unique<Impl::plan_t>());
-  Impl::plan_t* plan = d.plans.front().get();
-  plan->self = d.plans.begin();
-  plan->slot = slot;
-  plan->peer = dst.name;
-  plan->ops.reserve(chunks);
 
   for (const auto& w : writes) {
     for (uint64_t o = 0; o < w.len && !plan->err; ) {
@@ -764,7 +995,7 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
 	}
       }
       if (r) {
-	d.last_err = "fi_write: " + fi_err(r);
+	d.set_err("fi_write: " + fi_err(r));
 	d.writes_failed++;
 	plan->err = r == -FI_EAGAIN ? -ETIMEDOUT : to_errno(r);
 	plan->ops.pop_back();
@@ -793,7 +1024,7 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
       // out of budget with writes in flight: cut them off, so none of
       // them lands in the peer's window after the caller gave up
       d.timeouts++;
-      d.last_err = "writes still in flight at the deadline; cut off";
+      d.set_err("writes still in flight at the deadline; cut off");
       d.reset_locked();
       d.retire_locked(plan);
       return -ETIMEDOUT;
@@ -828,15 +1059,14 @@ Endpoint::stats_t Endpoint::stats() const
   s.staging_busy = d.staging_busy;
   s.timeouts = d.timeouts;
   s.resets = d.resets;
-  std::lock_guard l(d.mtx);
-  s.windows = d.windows.size();
+  s.peer_timeouts = d.peer_timeouts;
+  s.windows = d.nwindows;
   return s;
 }
 
 std::string Endpoint::last_error() const
 {
-  std::lock_guard l(impl->mtx);
-  return impl->last_err;
+  return impl->get_err();
 }
 
 } // namespace ceph::ofi
