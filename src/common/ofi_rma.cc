@@ -2072,13 +2072,21 @@ void WindowPool::release(uint64_t id, std::chrono::milliseconds quarantine,
   s.in_use = false;
   if (rekey) {
     if (ep.rekey_window(s.w) == 0) {
-      // nothing meant for the last operation can land any more
       st.rekeyed++;
-      s.quarantined_until = {};
-      return;
+      if (quarantine.count() == 0) {
+	// every write of the last operation completed, and a late
+	// duplicate of one carries the old key
+	s.quarantined_until = {};
+	return;
+      }
+      // a write that did not complete may still have packets on the way:
+      // the new key stops them only where the provider drops what carries
+      // the old one, so keep the window out until they are gone anyway
+      st.rekeyed_quarantined++;
+    } else {
+      st.rekey_failed++;
     }
     // writes with the old key may land until it has left the network
-    st.rekey_failed++;
     quarantine = std::max(quarantine, ep.key_quarantine());
   }
   if (quarantine.count() > 0) {

@@ -1339,6 +1339,57 @@ TEST_P(OfiRekey, WindowPoolRekeysOnRelease)
   EXPECT_FALSE(pool->acquire(W + 1));  // too large for any window
 }
 
+TEST_P(OfiRekey, WindowPoolKeepsAFailedPushOut)
+{
+  // a window released after a push that failed or was cut off gets a new
+  // key and still stays out for its quarantine, and for the key
+  // quarantine at least: the new key keeps that push's late packets out
+  // only if the provider drops what carries the old one
+  auto [prov, node] = GetParam();
+  window_owner_t a;
+  a.ep = open_target(prov, node);
+  if (!a.ep) {
+    GTEST_SKIP() << prov << " is not available";
+  }
+  const size_t W = 64 << 10;
+  a.mem.assign(3 * W, 0);
+  std::string err;
+  auto pool = WindowPool::create(*a.ep, a.mem.data(), W, 3, &err);
+  ASSERT_TRUE(pool) << err;
+
+  auto failed = pool->acquire(W);
+  ASSERT_TRUE(failed);
+  const auto k1 = parse_token(failed->token)->key;
+  pool->release(failed->id, ms(60000), true);
+  auto st = pool->stats();
+  EXPECT_EQ(1u, st.rekeyed);
+  EXPECT_EQ(1u, st.rekeyed_quarantined);
+
+  // a short quarantine is raised to the key quarantine (10 s)
+  auto cut = pool->acquire(W);
+  ASSERT_TRUE(cut);
+  EXPECT_NE(failed->id, cut->id);
+  pool->release(cut->id, ms(1), true);
+  std::this_thread::sleep_for(ms(20));
+
+  // a clean release is free at once, under a new key
+  auto clean = pool->acquire(W);
+  ASSERT_TRUE(clean);
+  EXPECT_NE(failed->id, clean->id);
+  EXPECT_NE(cut->id, clean->id);
+  const auto k3 = parse_token(clean->token)->key;
+  pool->release(clean->id, ms(0), true);
+  auto again = pool->acquire(W);
+  ASSERT_TRUE(again);
+  EXPECT_EQ(clean->id, again->id);
+  EXPECT_NE(k3, parse_token(again->token)->key);
+  EXPECT_NE(k1, parse_token(again->token)->key);
+  EXPECT_FALSE(pool->acquire(W));  // the other two are still out
+  st = pool->stats();
+  EXPECT_EQ(3u, st.rekeyed);
+  EXPECT_EQ(2u, st.rekeyed_quarantined);
+}
+
 namespace {
 
 /// n window owners on tcp, and a writer with the given limits whose

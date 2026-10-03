@@ -376,8 +376,8 @@ private:
  * key of its own. On release a window can get a new one, so that no write
  * meant for an earlier operation lands in a later one: not a peer's that
  * missed its operation, and not a provider's late duplicate of one that
- * completed. A window that could not get a new key, or is released with
- * a quarantine, stays out of use that long.
+ * completed. A window released with a quarantine, or that could not get
+ * a new key, stays out of use that long.
  */
 class WindowPool {
 public:
@@ -397,12 +397,16 @@ public:
   /// a free window of at least size bytes, or nullopt
   std::optional<lent_t> acquire(size_t size);
   /**
-   * Return a window. rekey gives it a new key first, after which no write
-   * meant for its last operation can land: it is free at once. Without
-   * rekey, or when the new key fails, it stays out of use for quarantine,
-   * and for the endpoint's key_quarantine at least when the new key
-   * failed. Call it only when no write of the operation is still
-   * expected.
+   * Return a window. rekey gives it a new key first. A window released
+   * without a quarantine - its operation's writes all completed - is
+   * then free at once: a late duplicate of one carries the old key.
+   *
+   * A quarantine says the operation's writes did not all complete: one
+   * failed, was cut off, or never reported back, and its packets may
+   * still be on the way. The new key keeps them out only if the provider
+   * drops what carries the old one, so the window stays out of use for
+   * the quarantine anyway, and for the endpoint's key_quarantine at least
+   * when it was re-keyed or the new key failed.
    */
   void release(uint64_t id, std::chrono::milliseconds quarantine, bool rekey);
 
@@ -410,6 +414,9 @@ public:
     uint64_t acquired = 0;
     uint64_t exhausted = 0;
     uint64_t rekeyed = 0;
+    /// re-keyed, and quarantined all the same: released after a write
+    /// that did not complete
+    uint64_t rekeyed_quarantined = 0;
     uint64_t rekey_failed = 0;
   };
   stats_t stats() const;
