@@ -198,8 +198,10 @@ public:
    * 1 MiB or more took for as many bytes.
    *
    * The first write to a peer adds it to the address vector. Some
-   * providers take long for that: the UET reference provider pings the
-   * peer, for up to 10 seconds. A thread of the endpoint's own does the
+   * providers take long for that: the UET reference provider waits for
+   * the peer's next hop to resolve, for up to a second, and older
+   * versions pinged it, for up to 10 seconds. A thread of the endpoint's
+   * own does the
    * insert, and writes to the same peer wait for it, each only until
    * its own budget runs out (-ETIMEDOUT, with nothing sent). The insert
    * goes on, so a later write finds the peer ready. On a thread-safe
@@ -207,7 +209,12 @@ public:
    * offers only FI_THREAD_DOMAIN allows no other call during the
    * insert: the insert waits until the writes in flight are done, so
    * none of them misses its cut-off, and writes that start meanwhile
-   * wait for it, again only within their budgets.
+   * wait for it, again only within their budgets. So do progress(),
+   * sync(), window_token() and the window calls, and with them a
+   * progress thread that places incoming data. A first write to a new
+   * peer returns -EBUSY at once, having sent nothing, when
+   * max_pending_inserts are already under way, or when max_peers are
+   * known and all of them are in use.
    */
   int write(const token_t& dst, const struct iovec* iov, size_t iovcnt,
 	    const std::vector<write_t>& writes,
