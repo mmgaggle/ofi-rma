@@ -96,6 +96,17 @@ struct config_t {
   /// quarantine hold their place in a provider that reuses them, so this
   /// bounds re-keys to about mr_cnt per key_quarantine.
   size_t mr_cnt = 16384;
+  /// Peers in the address vector at most. A first write to yet another
+  /// peer evicts the least recently used ones that no write uses, and is
+  /// refused (-EBUSY) when there are none.
+  size_t max_peers = 1024;
+  /// first contacts queued or running at once; a first write to yet
+  /// another peer is refused (-EBUSY), so the queue cannot grow with the
+  /// number of clients, which choose their endpoint names
+  size_t max_pending_inserts = 64;
+  /// threads adding peers, on a thread-safe domain; a FI_THREAD_DOMAIN
+  /// domain has one, since an insert there stops every other call
+  unsigned insert_threads = 4;
   /// for tests: runs on the insert thread just before each
   /// fi_av_insert(), with the peer's name, under the same locks
   std::function<void(const std::string&)> insert_hook;
@@ -219,6 +230,11 @@ public:
     /// writes that gave up before sending anything: their peer's
     /// address insert, or the endpoint, did not get ready in the budget
     uint64_t peer_timeouts = 0;
+    /// first writes to a new peer refused for max_pending_inserts or
+    /// max_peers, with nothing sent; the peers known and being added
+    uint64_t inserts_refused = 0;
+    uint64_t peers = 0;
+    uint64_t pending_inserts = 0;
     /// cut-offs whose close failed, and cut-offs that ended after a
     /// budget they protected
     uint64_t cutoffs_failed = 0;

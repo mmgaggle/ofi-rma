@@ -237,6 +237,7 @@ struct gate_t {
   std::mutex m;
   std::condition_variable cv;
   std::string hold;
+  bool hold_all = false;
   bool open = false;
   std::map<std::string, int> calls;
   clk::time_point held_at{};
@@ -244,9 +245,10 @@ struct gate_t {
   void enter(const std::string& name) {
     std::unique_lock l(m);
     calls[name]++;
-    if (name == hold) {
+    total++;
+    cv.notify_all();
+    if (hold_all || name == hold) {
       held_at = clk::now();
-      cv.notify_all();
       cv.wait(l, [this] { return open; });
     }
   }
@@ -266,6 +268,12 @@ struct gate_t {
     std::lock_guard l(m);
     return calls[name];
   }
+  /// wait until n inserts have started
+  bool wait_total(int n, ms timeout) {
+    std::unique_lock l(m);
+    return cv.wait_for(l, timeout, [&] { return total >= n; });
+  }
+  int total = 0;
 };
 
 std::unique_ptr<Endpoint> open_target(const std::string& prov,
@@ -898,6 +906,147 @@ TEST_P(OfiRekey, WindowPoolRekeysOnRelease)
   EXPECT_FALSE(pool->acquire(W));  // both out: one lent, one quarantined
   EXPECT_EQ(1u, pool->stats().exhausted);
   EXPECT_FALSE(pool->acquire(W + 1));  // too large for any window
+}
+
+namespace {
+
+/// n window owners on tcp, and a writer with the given limits whose
+/// inserts go through gate
+struct many_t {
+  std::vector<window_owner_t> owners;
+  std::unique_ptr<Endpoint> writer;
+  std::vector<char> src = std::vector<char>(4096, 'm');
+
+  bool open(int n, size_t max_peers, size_t max_pending,
+	    std::shared_ptr<gate_t> gate) {
+    owners.resize(n);
+    for (auto& o : owners) {
+      o.ep = open_target("tcp", "127.0.0.1");
+      if (!o.ep || !lend(o, 4096)) {
+	return false;
+      }
+    }
+    config_t c;
+    c.provider = "tcp";
+    c.node = "127.0.0.1";
+    c.stage_size = 4096;
+    c.stage_count = 2 * n;
+    c.max_peers = max_peers;
+    c.max_pending_inserts = max_pending;
+    c.insert_hook = [gate](const std::string& name) { gate->enter(name); };
+    std::string err;
+    writer = Endpoint::open(c, &err);
+    return static_cast<bool>(writer);
+  }
+  int write(int i, ms budget) {
+    iovec iov{src.data(), src.size()};
+    std::vector<Endpoint::write_t> one = {{0, src.size(), 0}};
+    return writer->write(owners[i].tok, &iov, 1, one, budget);
+  }
+  const std::string& name(int i) const { return owners[i].tok.name; }
+};
+
+} // anonymous namespace
+
+TEST(OfiPeerLimits, PendingInsertsAreBounded)
+{
+  // clients choose their endpoint names; first contacts beyond the bound
+  // are refused at once, instead of queueing behind slow inserts
+  auto gate = std::make_shared<gate_t>();
+  gate->hold_all = true;
+  many_t t;
+  if (!t.open(6, 64, 4, gate)) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  std::vector<std::thread> ts;
+  std::vector<int> rc(4, 1);
+  for (int i = 0; i < 4; i++) {
+    ts.emplace_back([&, i] { rc[i] = t.write(i, ms(5000)); });
+  }
+  // the four are queued or inserting; a fifth and sixth new peer are not
+  // taken
+  for (int i = 0; i < 100 && t.writer->stats().pending_inserts < 4; i++) {
+    std::this_thread::sleep_for(ms(10));
+  }
+  EXPECT_EQ(4u, t.writer->stats().pending_inserts);
+  const auto t0 = clk::now();
+  EXPECT_EQ(-EBUSY, t.write(4, ms(5000)));
+  EXPECT_EQ(-EBUSY, t.write(5, ms(5000)));
+  EXPECT_LT(clk::now() - t0, ms(1000));
+  EXPECT_EQ(2u, t.writer->stats().inserts_refused);
+  gate->release();
+  for (auto& th : ts) {
+    th.join();
+  }
+  for (int i = 0; i < 4; i++) {
+    EXPECT_EQ(0, rc[i]) << "writer " << i << ": " << t.writer->last_error();
+  }
+  // with room again, the refused ones get in
+  EXPECT_EQ(0, t.write(4, BUDGET)) << t.writer->last_error();
+  EXPECT_EQ(0, t.write(5, BUDGET)) << t.writer->last_error();
+  EXPECT_EQ(0u, t.writer->stats().pending_inserts);
+}
+
+TEST(OfiPeerLimits, EvictsIdlePeersOnly)
+{
+  // a full table evicts the least recently used idle peer, never one
+  // being added; an evicted peer is added again when written to
+  auto gate = std::make_shared<gate_t>();
+  many_t t;
+  if (!t.open(4, 2, 8, gate)) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  ASSERT_EQ(0, t.write(0, BUDGET)) << t.writer->last_error();
+  std::this_thread::sleep_for(ms(5));
+  ASSERT_EQ(0, t.write(1, BUDGET)) << t.writer->last_error();
+  EXPECT_EQ(2u, t.writer->stats().peers);
+
+  // the third peer's insert is held; peer 0, the least recently used,
+  // makes room for it
+  gate->hold = t.name(2);
+  std::atomic<int> r2{1};
+  std::thread a([&] { r2 = t.write(2, ms(10000)); });
+  ASSERT_TRUE(gate->wait_held(ms(5000)));
+  // a fourth new peer finds no idle peer to evict but peer 1, and peer 2
+  // is being added, so it evicts peer 1 and does not touch peer 2
+  EXPECT_EQ(0, t.write(3, BUDGET)) << t.writer->last_error();
+  gate->release();
+  a.join();
+  EXPECT_EQ(0, r2.load()) << t.writer->last_error();
+  EXPECT_EQ(1, gate->count(t.name(2)));
+  EXPECT_LE(t.writer->stats().peers, 3u);
+  // an evicted peer comes back on its next write
+  const auto inserted = t.writer->stats().peers_inserted;
+  EXPECT_EQ(0, t.write(0, BUDGET)) << t.writer->last_error();
+  EXPECT_EQ(inserted + 1, t.writer->stats().peers_inserted);
+  EXPECT_EQ(2, gate->count(t.name(0)));
+}
+
+TEST(OfiPeerLimits, DestroyWithInsertsPending)
+{
+  // an endpoint destroyed while inserts are queued and one is still in
+  // the provider waits for that one, drops the rest, and does not crash
+  auto gate = std::make_shared<gate_t>();
+  gate->hold_all = true;
+  many_t t;
+  if (!t.open(6, 64, 64, gate)) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  for (int i = 0; i < 6; i++) {
+    EXPECT_EQ(-ETIMEDOUT, t.write(i, ms(150)));
+  }
+  EXPECT_EQ(6u, t.writer->stats().pending_inserts);
+  ASSERT_TRUE(gate->wait_total(1, ms(5000)));
+  std::thread opener([&] {
+    std::this_thread::sleep_for(ms(300));
+    gate->release();
+  });
+  const auto t0 = clk::now();
+  t.writer.reset();
+  EXPECT_LT(clk::now() - t0, ms(5000));
+  opener.join();
+  // the four insert threads had started at most four inserts
+  EXPECT_LE(gate->total, 4);
 }
 
 TEST(OfiLateStart, DoesNotCutOffOthers)
