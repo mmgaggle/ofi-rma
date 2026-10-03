@@ -79,6 +79,10 @@ struct config_t {
   /// for tests: runs on the insert thread just before each
   /// fi_av_insert(), with the peer's name, under the same locks
   std::function<void(const std::string&)> insert_hook;
+  /// for tests: runs in a cut-off just before the endpoint is closed. A
+  /// nonzero return stands for fi_close() failing with it, and the
+  /// endpoint stays open.
+  std::function<int()> cutoff_close_hook;
 };
 
 class Endpoint {
@@ -124,8 +128,13 @@ public:
    * for another provider's token, -EBUSY when no staging buffer is
    * free, -E2BIG when the source does not fit one, -ETIMEDOUT when the
    * budget ran out, -ECANCELED when another write's cut-off took this
-   * one's writes with it. After a failure the window may hold some of
-   * the bytes.
+   * one's writes with it, -EIO when the endpoint takes no more writes.
+   * After a failure the window may hold some of the bytes.
+   *
+   * -ENOTRECOVERABLE means a cut-off went wrong: closing the endpoint
+   * failed, so its writes were not cut off, or the cut-off ended after
+   * this write's budget. Bytes may land in the window after the caller
+   * gave up. The endpoint is then unsafe() and takes no more writes.
    *
    * The budget bounds when the writes may still land. A write that is
    * still in flight when it runs out is cut off: the endpoint closes
@@ -169,11 +178,21 @@ public:
     /// writes that gave up before sending anything: their peer's
     /// address insert, or the endpoint, did not get ready in the budget
     uint64_t peer_timeouts = 0;
+    /// cut-offs whose close failed, and cut-offs that ended after a
+    /// budget they protected
+    uint64_t cutoffs_failed = 0;
+    uint64_t cutoffs_late = 0;
+    bool unsafe = false;
+    /// takes no more writes: unsafe, or a cut-off could not reopen it
+    bool broken = false;
     uint64_t windows = 0;
   };
   stats_t stats() const;
   /// the provider's text for the most recent failed completion
   std::string last_error() const;
+  /// a cut-off failed or ended late (see write()); the endpoint takes no
+  /// more writes, and writes it took may still land
+  bool unsafe() const;
 
   struct Impl;
 private:

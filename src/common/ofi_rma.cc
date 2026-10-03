@@ -251,6 +251,8 @@ struct Endpoint::Impl {
     std::vector<op_t> ops;  ///< reserved up front, never reallocated
     uint32_t outstanding = 0;
     int err = 0;
+    /// when the caller's budget runs out: nothing may land after it
+    std::chrono::steady_clock::time_point budget_end{};
     size_t slot = 0;
     std::string peer;
     std::list<std::unique_ptr<plan_t>>::iterator self;
@@ -289,10 +291,18 @@ struct Endpoint::Impl {
   std::atomic<uint64_t> timeouts{0};
   std::atomic<uint64_t> peer_timeouts{0};
 
-  /// set when a cut-off could not reopen the endpoint; every write
-  /// fails from then on
-  bool broken = false;
+  /// set when a cut-off could not reopen the endpoint, or when the
+  /// endpoint is unsafe; every write fails from then on
+  std::atomic<bool> broken{false};
+  /// A cut-off failed, or ended after a budget it protected: writes may
+  /// have landed, or may still land, after their callers gave up. Nothing
+  /// calls into the provider for this endpoint again, except to close it.
+  std::atomic<bool> unsafe{false};
+  /// the endpoint did not close in a cut-off, and is still open
+  bool zombie = false;
   std::atomic<uint64_t> resets{0};
+  std::atomic<uint64_t> cutoffs_failed{0};
+  std::atomic<uint64_t> cutoffs_late{0};
   /// how long a cut-off takes, at most, as measured, in milliseconds; a
   /// write stops waiting this much before its budget runs out
   std::atomic<int64_t> reset_cost_ms{100};
@@ -302,8 +312,12 @@ struct Endpoint::Impl {
   /// and read the endpoint's name
   int open_ep(std::string* err);
   /// cut off every write in flight by closing and reopening the
-  /// endpoint; plans still waiting fail with -ECANCELED
+  /// endpoint; plans still waiting fail with -ECANCELED, or with
+  /// -ENOTRECOVERABLE when the cut-off failed or ended after their budget
   void reset_locked();
+  /// a cut-off went wrong: fail every waiting plan with -ENOTRECOVERABLE
+  /// and take no more writes
+  void make_unsafe_locked(std::string why);
   /// register memory; a region others write into needs a key, a local
   /// write source only a descriptor
   int reg(char* ptr, size_t len, uint64_t access, region_t* out);
@@ -350,7 +364,11 @@ Endpoint::Impl::~Impl()
   }
   // the endpoint first: it cancels whatever is still in flight, after
   // which no write references the regions
-  if (ep) fi_close(&ep->fid);
+  if (ep && fi_close(&ep->fid)) {
+    // still open after a failed cut-off, and it may still read the
+    // staging buffer or write the windows: leave all of it
+    return;
+  }
   for (auto& [id, w] : windows) {
     // a window loses its region when re-registering it after a cut-off
     // failed
@@ -423,7 +441,7 @@ void Endpoint::Impl::complete_locked(op_t* op, int err)
 size_t Endpoint::Impl::poll_locked()
 {
   size_t got = 0;
-  if (!cq) {
+  if (!cq || zombie) {
     return got;
   }
   fi_cq_entry ent[16];
@@ -600,8 +618,8 @@ void Endpoint::Impl::insert_loop()
       }
     }
     fi_addr_t addr = FI_ADDR_NOTAVAIL;
-    int r = -FI_ESHUTDOWN;
-    if (!stopping) {
+    int r = broken ? -FI_EIO : -FI_ESHUTDOWN;
+    if (!stopping && !broken) {
       {
 	std::lock_guard pl(peer_mtx);
 	evict_locked();
@@ -707,6 +725,20 @@ int Endpoint::Impl::open_ep(std::string* err)
   return 0;
 }
 
+void Endpoint::Impl::make_unsafe_locked(std::string why)
+{
+  unsafe = true;
+  broken = true;
+  set_err(std::move(why));
+  for (auto& p : plans) {
+    if (p->outstanding) {
+      p->outstanding = 0;
+      p->err = -ENOTRECOVERABLE;
+    }
+  }
+  done_cv.notify_all();
+}
+
 void Endpoint::Impl::reset_locked()
 {
   const auto t0 = std::chrono::steady_clock::now();
@@ -716,28 +748,59 @@ void Endpoint::Impl::reset_locked()
   // The completion queue goes too, with any completions of those
   // operations, whose contexts are about to be released.
   if (ep) {
-    fi_close(&ep->fid);
+    int r = cfg.cutoff_close_hook ? cfg.cutoff_close_hook() : 0;
+    if (r == 0) {
+      r = fi_close(&ep->fid);
+    }
+    if (r) {
+      // the endpoint is still open, and so are its writes: they were not
+      // cut off and can land at any time
+      cutoffs_failed++;
+      zombie = true;
+      make_unsafe_locked("a cut-off failed: closing the endpoint: " +
+			 fi_err(r) + "; its writes may still land");
+      return;
+    }
     ep = nullptr;
   }
   if (cq) {
-    fi_close(&cq->fid);
+    if (int r = fi_close(&cq->fid); r) {
+      // the endpoint is closed, so its writes are cut off; the queue
+      // only stays allocated
+      set_err("closing the completion queue in a cut-off: " + fi_err(r));
+    }
     cq = nullptr;
     cq_fd = -1;
   }
-  // every plan with writes in flight has lost them, and its writer has
+  // Every plan with writes in flight has lost them, and its writer has
   // to hear it. One with none in flight has lost nothing: it is done, or
   // its writer is still gathering or posting and goes on with the new
-  // endpoint.
+  // endpoint. A plan whose budget ran out before the writes were cut off
+  // may have had some land after it.
+  const auto cut = std::chrono::steady_clock::now();
+  bool late = false;
   for (auto& p : plans) {
     if (p->outstanding == 0) {
       continue;
     }
     p->outstanding = 0;
-    if (!p->err) {
+    if (cut > p->budget_end) {
+      late = true;
+      p->err = -ENOTRECOVERABLE;
+    } else if (!p->err) {
       p->err = -ECANCELED;
     }
   }
   done_cv.notify_all();
+  if (late) {
+    cutoffs_late++;
+    make_unsafe_locked(
+      "a cut-off took " + std::to_string(
+	std::chrono::duration_cast<std::chrono::milliseconds>(cut - t0).count()) +
+      " ms and ended after the budget it protected; writes may have "
+      "landed late");
+    return;
+  }
   // regions bound to the old endpoint are gone with it
   const bool rebind = mr_mode & FI_MR_ENDPOINT;
   if (rebind) {
@@ -975,7 +1038,8 @@ std::string Endpoint::window_token(const window_t& w, uint64_t ofs,
   auto& d = *impl;
   std::lock_guard l(d.mtx);
   auto it = d.windows.find(w.id);
-  if (it == d.windows.end() || !it->second.mr || ofs + len > it->second.len) {
+  if (d.broken || it == d.windows.end() || !it->second.mr ||
+      ofs + len > it->second.len) {
     return {};
   }
   token_t t;
@@ -1019,8 +1083,8 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
   if (budget <= reset_cost) {
     return -ETIMEDOUT;
   }
-  const auto deadline = std::chrono::steady_clock::now() + budget -
-    reset_cost;
+  const auto budget_end = std::chrono::steady_clock::now() + budget;
+  const auto deadline = budget_end - reset_cost;
   // the peer's address first, without the endpoint lock: the insert of a
   // new peer can take seconds
   fi_addr_t addr;
@@ -1057,6 +1121,7 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
   plan->self = d.plans.begin();
   plan->slot = slot;
   plan->peer = dst.name;
+  plan->budget_end = budget_end;
   plan->ops.reserve(chunks);
 
   // gather the source into the slot without the lock: it can be
@@ -1154,8 +1219,11 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
       d.timeouts++;
       d.set_err("writes still in flight at the deadline; cut off");
       d.reset_locked();
+      // a cut-off that went wrong is not a clean one
+      const int res = plan->err == -ENOTRECOVERABLE ? -ENOTRECOVERABLE :
+	-ETIMEDOUT;
       d.retire_locked(plan);
-      return -ETIMEDOUT;
+      return res;
     }
     if (!polling && !d.poller) {
       polling = d.poller = true;
@@ -1203,6 +1271,10 @@ Endpoint::stats_t Endpoint::stats() const
   s.timeouts = d.timeouts;
   s.resets = d.resets;
   s.peer_timeouts = d.peer_timeouts;
+  s.cutoffs_failed = d.cutoffs_failed;
+  s.cutoffs_late = d.cutoffs_late;
+  s.unsafe = d.unsafe;
+  s.broken = d.broken;
   s.windows = d.nwindows;
   return s;
 }
@@ -1210,6 +1282,11 @@ Endpoint::stats_t Endpoint::stats() const
 std::string Endpoint::last_error() const
 {
   return impl->get_err();
+}
+
+bool Endpoint::unsafe() const
+{
+  return impl->unsafe;
 }
 
 } // namespace ceph::ofi

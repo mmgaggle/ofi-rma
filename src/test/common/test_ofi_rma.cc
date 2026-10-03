@@ -649,6 +649,108 @@ TEST(OfiConcurrentWritesStalled, Tcp)
     << "cpu " << cpu.count() << " s over " << wall.count() << " s";
 }
 
+namespace {
+
+/// A window owner that stopped polling after the writer connected, and
+/// a writer whose cut-offs go through hook: writes into the owner cannot
+/// complete over tcp, so each one ends in a cut-off.
+struct stalled_t {
+  window_owner_t s;
+  std::unique_ptr<Endpoint> writer;
+  static constexpr size_t S = 4 << 20;
+  std::vector<char> src = std::vector<char>(S, 'k');
+
+  bool open(std::function<int()> hook) {
+    s.ep = open_target("tcp", "127.0.0.1", false);
+    config_t c;
+    c.provider = "tcp";
+    c.node = "127.0.0.1";
+    c.stage_size = S;
+    c.stage_count = 4;
+    c.cutoff_close_hook = std::move(hook);
+    std::string err;
+    writer = Endpoint::open(c, &err);
+    if (!s.ep || !writer || !lend(s, 4 * S)) {
+      return false;
+    }
+    std::atomic<bool> stop{false};
+    std::thread poller([&] { while (!stop) s.ep->progress(); });
+    iovec iov{src.data(), 4096};
+    std::vector<Endpoint::write_t> one = {{0, 4096, 0}};
+    const int r = writer->write(s.tok, &iov, 1, one, BUDGET);
+    stop = true;
+    poller.join();
+    return r == 0;
+  }
+  /// write slot i of the owner's window with the given budget
+  int write(int i, ms budget) {
+    iovec iov{src.data(), S};
+    std::vector<Endpoint::write_t> one = {{0, S, i * S}};
+    return writer->write(s.tok, &iov, 1, one, budget);
+  }
+};
+
+} // anonymous namespace
+
+TEST(OfiCutOffFails, Tcp)
+{
+  // the provider fails to close the endpoint in a cut-off: its writes are
+  // not cut off and may still land. No write may report a clean cut-off,
+  // and the endpoint must take no more writes.
+  stalled_t t;
+  if (!t.open([] { return -EBUSY; })) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  std::atomic<int> r0{1}, r1{1};
+  std::thread a([&] { r0 = t.write(0, ms(600)); });
+  std::this_thread::sleep_for(ms(20));
+  std::thread b([&] { r1 = t.write(1, ms(5000)); });
+  a.join();
+  b.join();
+  EXPECT_EQ(-ENOTRECOVERABLE, r0.load());
+  EXPECT_EQ(-ENOTRECOVERABLE, r1.load());
+  EXPECT_TRUE(t.writer->unsafe());
+  const auto st = t.writer->stats();
+  EXPECT_EQ(1u, st.cutoffs_failed);
+  EXPECT_TRUE(st.unsafe);
+  EXPECT_TRUE(st.broken);
+  EXPECT_NE(std::string::npos, t.writer->last_error().find("cut-off failed"))
+    << t.writer->last_error();
+
+  // nothing more goes out
+  window_owner_t h;
+  h.ep = open_target("tcp", "127.0.0.1");
+  ASSERT_TRUE(h.ep && lend(h, 4096));
+  iovec iov{t.src.data(), 4096};
+  std::vector<Endpoint::write_t> one = {{0, 4096, 0}};
+  EXPECT_EQ(-EIO, t.writer->write(h.tok, &iov, 1, one, BUDGET));
+}
+
+TEST(OfiCutOffLate, Tcp)
+{
+  // a cut-off that ends after a write's budget may have let bytes land
+  // after it: that write fails with -ENOTRECOVERABLE and the endpoint
+  // turns unsafe. A write whose budget the cut-off still met is merely
+  // cancelled.
+  stalled_t t;
+  if (!t.open([] { std::this_thread::sleep_for(ms(400)); return 0; })) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  std::atomic<int> r0{1}, r1{1};
+  std::thread a([&] { r0 = t.write(0, ms(600)); });
+  std::this_thread::sleep_for(ms(20));
+  std::thread b([&] { r1 = t.write(1, ms(20000)); });
+  a.join();
+  b.join();
+  EXPECT_EQ(-ENOTRECOVERABLE, r0.load());
+  EXPECT_EQ(-ECANCELED, r1.load());
+  EXPECT_TRUE(t.writer->unsafe());
+  const auto st = t.writer->stats();
+  EXPECT_EQ(1u, st.cutoffs_late);
+  EXPECT_EQ(0u, st.cutoffs_failed);
+  EXPECT_EQ(-EIO, t.write(2, ms(2000)));
+}
+
 INSTANTIATE_TEST_SUITE_P(
   Providers, OfiConcurrentWrites,
   ::testing::Values(std::make_pair("tcp", "127.0.0.1"),
