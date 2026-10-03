@@ -58,6 +58,11 @@ constexpr int REKEY_ATTEMPTS = 8;
 /// do not know them.
 constexpr int OPT_CLOSE_DISCARDS = static_cast<int>((1U << 31) | 0x5545U);
 constexpr int OPT_CANCEL_DISCARDS = static_cast<int>((1U << 31) | 0x5543U);
+/// fi_control() command of the UET libfabric provider (FI_UET_MR_REKEY in
+/// its prov/uet_fi.h): give a region a new key in place, returned in a
+/// uint64_t, the old key dead when the call returns; -FI_ENOSYS from a
+/// provider or device that cannot
+constexpr int MR_REKEY = static_cast<int>((1U << 31) | 0x554bU);
 /// the least time a write must have left to post; see write()
 constexpr std::chrono::milliseconds POST_MARGIN{1};
 /// plans this large or larger teach the endpoint how fast plans move;
@@ -240,6 +245,11 @@ struct Endpoint::Impl {
     retired_order;
   std::atomic<uint64_t> windows_rekeyed{0};
   std::atomic<uint64_t> key_collisions{0};
+  std::atomic<uint64_t> rekeys_in_place{0};
+  std::atomic<uint64_t> rekeys_reregistered{0};
+  /// the provider re-keys a region in place: 1 yes, 0 no, -1 not tried;
+  /// once it says it cannot, it is not asked again
+  std::atomic<int> rekey_in_place{-1};
   /// register a window's memory, under a key out of quarantine
   int reg_window_locked(char* ptr, size_t len, region_t* out);
   /// close a window's region, and put its key in quarantine
@@ -1548,6 +1558,32 @@ int Endpoint::rekey_window(const window_t& w)
     return -ENOENT;
   }
   Impl::region_t& cur = it->second;
+  if (d.rekey_in_place != 0) {
+    // in place: the region keeps its memory, registration and binding
+    uint64_t key = 0;
+    const int r = fi_control(&cur.mr->fid, MR_REKEY, &key);
+    if (r == 0 && key != cur.key && key != FI_KEY_NOTAVAIL &&
+	!d.retired.count(key)) {
+      // the provider never gives the old key out again, so it needs no
+      // quarantine
+      d.rekey_in_place = 1;
+      cur.key = key;
+      d.windows_rekeyed++;
+      d.rekeys_in_place++;
+      return 0;
+    }
+    if (r == -FI_ENOSYS || r == -FI_EOPNOTSUPP) {
+      d.rekey_in_place = 0;
+    } else if (r == 0) {
+      // a key that is still in quarantine, or none at all: the old key is
+      // dead already; register the memory again for a sound one
+      d.key_collisions++;
+      cur.key = key;
+    } else {
+      d.set_err("re-keying a window in place: " + fi_err(r) +
+		"; registering it again");
+    }
+  }
   // the new region first, while the old one still holds its key, so the
   // provider cannot hand the old key straight back
   Impl::region_t fresh;
@@ -1561,6 +1597,7 @@ int Endpoint::rekey_window(const window_t& w)
   }
   cur = fresh;
   d.windows_rekeyed++;
+  d.rekeys_reregistered++;
   return 0;
 }
 
@@ -1893,6 +1930,9 @@ Endpoint::stats_t Endpoint::stats() const
   s.close_discards = d.close_discards;
   s.windows_rekeyed = d.windows_rekeyed;
   s.key_collisions = d.key_collisions;
+  s.rekeys_in_place = d.rekeys_in_place;
+  s.rekeys_reregistered = d.rekeys_reregistered;
+  s.rekey_in_place = d.rekey_in_place;
   s.unsafe = d.unsafe;
   s.broken = d.broken;
   s.windows = d.nwindows;

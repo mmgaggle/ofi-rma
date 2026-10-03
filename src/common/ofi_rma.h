@@ -178,7 +178,10 @@ public:
   void deregister_window(uint64_t id);
   /**
    * Give a window a new memory key before its memory is reused for
-   * another operation. Every token issued for it before stops working: a
+   * another operation. A provider that can (the UET provider's
+   * FI_UET_MR_REKEY) changes the key in place, keeping the memory's
+   * registration; otherwise the memory is registered again and the old
+   * region closed. Every token issued for it before stops working: a
    * write that still carries the old key fails instead of landing, as a
    * late duplicate of a write that completed long ago can over a provider
    * that retransmits without connection state (UET's RUDI). Call it only
@@ -318,6 +321,11 @@ public:
     /// while still in quarantine, which were dropped
     uint64_t windows_rekeyed = 0;
     uint64_t key_collisions = 0;
+    /// re-keys done in place, and by registering the memory again; and
+    /// whether the provider re-keys in place: 1 yes, 0 no, -1 not tried
+    uint64_t rekeys_in_place = 0;
+    uint64_t rekeys_reregistered = 0;
+    int rekey_in_place = -1;
     bool unsafe = false;
     /// takes no more writes: unsafe, or a cut-off could not reopen it
     bool broken = false;

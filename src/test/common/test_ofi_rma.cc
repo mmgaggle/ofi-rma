@@ -1138,11 +1138,24 @@ TEST_P(OfiRekey, OldTokenStopsWorking)
   ASSERT_EQ(0, writer->write(*t1, &iov, 1, all, BUDGET)) << writer->last_error();
 
   // the window is reused: new key, then new contents
+  EXPECT_EQ(-1, a.ep->stats().rekey_in_place);  // not asked yet
   ASSERT_EQ(0, a.ep->rekey_window(w)) << a.ep->last_error();
   auto t2 = parse_token(a.ep->window_token(w, 0, N));
   ASSERT_TRUE(t2);
   EXPECT_NE(t1->key, t2->key);
-  EXPECT_EQ(1u, a.ep->stats().windows_rekeyed);
+  auto st = a.ep->stats();
+  EXPECT_EQ(1u, st.windows_rekeyed);
+  // tcp and shm cannot re-key in place: the memory was registered again,
+  // and the provider is not asked again
+  EXPECT_EQ(0, st.rekey_in_place);
+  EXPECT_EQ(0u, st.rekeys_in_place);
+  EXPECT_EQ(1u, st.rekeys_reregistered);
+  ASSERT_EQ(0, a.ep->rekey_window(w)) << a.ep->last_error();
+  auto t3 = parse_token(a.ep->window_token(w, 0, N));
+  ASSERT_TRUE(t3);
+  EXPECT_NE(t2->key, t3->key);
+  EXPECT_EQ(2u, a.ep->stats().rekeys_reregistered);
+  t2 = t3;
   a.ep->sync();
   std::fill(a.mem.begin(), a.mem.end(), 'n');
 
