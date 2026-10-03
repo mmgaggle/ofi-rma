@@ -1671,9 +1671,12 @@ std::string Endpoint::window_token(const window_t& w, uint64_t ofs,
 
 int Endpoint::write(const token_t& dst, const struct iovec* iov,
 		    size_t iovcnt, const std::vector<write_t>& writes,
-		    std::chrono::milliseconds budget)
+		    std::chrono::milliseconds budget, bool* posted)
 {
   auto& d = *impl;
+  if (posted) {
+    *posted = false;
+  }
   if (!d.stage) {
     return -EOPNOTSUPP;
   }
@@ -1822,6 +1825,9 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
       }
       plan->outstanding++;
       d.writes_posted++;
+      if (posted) {
+	*posted = true;
+      }
       o += n;
     }
     if (plan->err || plan->cut) {

@@ -1090,6 +1090,40 @@ TEST(OfiLateCutOff, ManyWritersLeftIdle)
   EXPECT_LT(st.max_cutoff_lateness_ms, 1000u);
 }
 
+TEST(OfiWritePosted, SaysWhetherAnythingWentOut)
+{
+  // the caller learns whether any write reached the provider: an OSD
+  // tells its client that no transfer started, so the client need not
+  // wait out the fence
+  stalled_t t;
+  if (!t.open(nullptr)) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  window_owner_t h;
+  h.ep = open_target("tcp", "127.0.0.1");
+  ASSERT_TRUE(h.ep && lend(h, 4096));
+  iovec iov{t.src.data(), 4096};
+  std::vector<Endpoint::write_t> one = {{0, 4096, 0}};
+  bool posted = true;
+  // refused for its budget: nothing went out
+  EXPECT_EQ(-ETIMEDOUT, t.writer->write(h.tok, &iov, 1, one, ms(5), &posted));
+  EXPECT_FALSE(posted);
+  // out of range: nothing went out
+  std::vector<Endpoint::write_t> past = {{0, 4096, 8192}};
+  posted = true;
+  EXPECT_EQ(-ERANGE, t.writer->write(h.tok, &iov, 1, past, BUDGET, &posted));
+  EXPECT_FALSE(posted);
+  // delivered
+  EXPECT_EQ(0, t.writer->write(h.tok, &iov, 1, one, BUDGET, &posted));
+  EXPECT_TRUE(posted);
+  // posted, then cut off: it went out
+  posted = false;
+  iovec big{t.src.data(), stalled_t::S};
+  std::vector<Endpoint::write_t> all = {{0, stalled_t::S, 0}};
+  EXPECT_EQ(-ETIMEDOUT, t.writer->write(t.s.tok, &big, 1, all, ms(600), &posted));
+  EXPECT_TRUE(posted);
+}
+
 TEST(OfiCutOffFails, Tcp)
 {
   // the provider fails to close the endpoint in a cut-off: its writes are

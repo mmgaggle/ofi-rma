@@ -216,6 +216,10 @@ public:
    * one's writes with it, -EIO when the endpoint takes no more writes.
    * After a failure the window may hold some of the bytes.
    *
+   * *posted, when given, says whether any write was handed to the
+   * provider: false means that nothing of this call reached the window,
+   * whatever it returns.
+   *
    * -ENOTRECOVERABLE means a cut-off went wrong: closing the endpoint
    * failed, so its writes were not cut off, or the cut-off ended after
    * this write's budget. Bytes may land in the window after the caller
@@ -276,7 +280,7 @@ public:
    */
   int write(const token_t& dst, const struct iovec* iov, size_t iovcnt,
 	    const std::vector<write_t>& writes,
-	    std::chrono::milliseconds budget);
+	    std::chrono::milliseconds budget, bool* posted = nullptr);
 
   /// one pass over the completion queue
   void progress();
