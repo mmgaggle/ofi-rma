@@ -9,7 +9,9 @@
 #include <cstring>
 #include <iostream>
 #include <map>
+#include <array>
 #include <mutex>
+#include <random>
 #include <set>
 #include <string_view>
 #include <thread>
@@ -859,6 +861,7 @@ TEST(OfiPerPlanCutOff, LateCancelIsUnsafe)
   stalled_t t;
   if (!t.open(nullptr, [](config_t& c) {
 	c.cancel_hook = [] { std::this_thread::sleep_for(ms(400)); return 0; };
+	c.late_tolerance = ms(200);
       })) {
     GTEST_SKIP() << "tcp is not available";
   }
@@ -884,6 +887,168 @@ TEST(OfiPerPlanCutOff, ProvidersThatDoNotSay)
     EXPECT_FALSE(st.cancel_discards) << prov;
     EXPECT_EQ(-1, st.close_discards) << prov;
   }
+}
+
+namespace {
+
+/// a wait hook that, once, on the thread that set mine, sleeps for d as
+/// soon as the writer is within 20 ms of its deadline: a writer the
+/// scheduler left idle just when it should cut its writes off
+struct idle_writer_t {
+  std::atomic<bool> slept{false};
+  ms d;
+  explicit idle_writer_t(ms d) : d(d) {}
+  static inline thread_local bool mine = false;
+  std::function<void(clk::time_point)> hook() {
+    return [this](clk::time_point deadline) {
+      if (mine && clk::now() > deadline - ms(20) && !slept.exchange(true)) {
+	std::this_thread::sleep_for(d);
+      }
+    };
+  }
+};
+
+} // anonymous namespace
+
+TEST(OfiLateCutOff, WithinToleranceIsCounted)
+{
+  // A lone writer is left idle past its deadline, so its cut-off starts
+  // late and ends after its budget, but within the tolerance: the write
+  // is cut off as usual, the lateness counted, the endpoint goes on, and
+  // the scheduling slack it keeps grows.
+  idle_writer_t idle(ms(300));
+  stalled_t t;
+  if (!t.open(nullptr, [&](config_t& c) { c.wait_hook = idle.hook(); })) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  const auto slack0 = t.writer->stats().cutoff_slack_ms;
+  idle_writer_t::mine = true;
+  EXPECT_EQ(-ETIMEDOUT, t.write(0, ms(600)));
+  idle_writer_t::mine = false;
+  const auto st = t.writer->stats();
+  EXPECT_TRUE(idle.slept);
+  EXPECT_EQ(1u, st.cutoffs_late);
+  EXPECT_GT(st.max_cutoff_lateness_ms, 0u);
+  EXPECT_LT(st.max_cutoff_lateness_ms, 1000u);
+  EXPECT_GT(st.cutoff_slack_ms, slack0);
+  EXPECT_FALSE(st.unsafe) << t.writer->last_error();
+  EXPECT_NE(std::string::npos, t.writer->last_error().find("within the tolerance"))
+    << t.writer->last_error();
+}
+
+TEST(OfiLateCutOff, BeyondToleranceIsUnsafe)
+{
+  idle_writer_t idle(ms(800));
+  stalled_t t;
+  if (!t.open(nullptr, [&](config_t& c) {
+	c.wait_hook = idle.hook();
+	c.late_tolerance = ms(200);
+      })) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  idle_writer_t::mine = true;
+  EXPECT_EQ(-ENOTRECOVERABLE, t.write(0, ms(600)));
+  idle_writer_t::mine = false;
+  const auto st = t.writer->stats();
+  EXPECT_EQ(1u, st.cutoffs_late);
+  EXPECT_TRUE(st.unsafe);
+}
+
+TEST(OfiLateCutOff, AnIdleWriterIsCutOffOnTime)
+{
+  // A writer is left idle for 1.5 s just before its deadline, far past
+  // its budget. Another writer of the endpoint polls meanwhile, and cuts
+  // the idle one's writes off on its behalf, on time: nothing is late.
+  idle_writer_t idle(ms(1500));
+  stalled_t t;
+  if (!t.open(nullptr, [&](config_t& c) {
+	c.wait_hook = idle.hook();
+	c.stage_count = 8;
+      })) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  window_owner_t h;
+  h.ep = open_target("tcp", "127.0.0.1");
+  ASSERT_TRUE(h.ep && lend(h, 64 << 10));
+  std::atomic<bool> stop{false};
+  std::thread healthy([&] {
+    iovec iov{t.src.data(), 64 << 10};
+    std::vector<Endpoint::write_t> one = {{0, 64 << 10, 0}};
+    while (!stop) {
+      t.writer->write(h.tok, &iov, 1, one, BUDGET);
+      std::this_thread::sleep_for(ms(2));
+    }
+  });
+  int r = 1;
+  clk::duration took{};
+  std::thread idle_one([&] {
+    idle_writer_t::mine = true;
+    const auto a = clk::now();
+    r = t.write(0, ms(800));
+    took = clk::now() - a;
+  });
+  idle_one.join();
+  stop = true;
+  healthy.join();
+  EXPECT_TRUE(idle.slept);
+  EXPECT_EQ(-ETIMEDOUT, r);
+  EXPECT_GT(took, ms(1500));  // it slept through its budget
+  const auto st = t.writer->stats();
+  EXPECT_EQ(0u, st.cutoffs_late);
+  EXPECT_GE(st.cutoffs_on_behalf, 1u);
+  EXPECT_FALSE(st.unsafe) << t.writer->last_error();
+}
+
+TEST(OfiLateCutOff, ManyWritersLeftIdle)
+{
+  // Eight writes into a stalled owner, with deadlines between 0.4 and
+  // 1.1 s, each writer left idle once near its deadline for up to 0.4 s,
+  // over a provider that cuts writes off one by one. The writers that
+  // run cut the idle ones off on their behalf; whatever is late stays
+  // within the tolerance, and the endpoint never turns unsafe.
+  std::array<std::unique_ptr<idle_writer_t>, 8> idle;
+  std::mt19937 rng(42);
+  for (auto& i : idle) {
+    i = std::make_unique<idle_writer_t>(ms(rng() % 400));
+  }
+  thread_local int who = -1;
+  stalled_t t;
+  if (!t.open(nullptr, [&](config_t& c) {
+	c.stage_count = 10;
+	c.cancel_hook = [] { return 0; };
+	c.wait_hook = [&](clk::time_point deadline) {
+	  if (who >= 0) {
+	    idle_writer_t::mine = true;
+	    idle[who]->hook()(deadline);
+	  }
+	};
+      })) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  t.s.mem.assign(8 * stalled_t::S, 0);
+  Endpoint::window_t w;
+  ASSERT_EQ(0, t.s.ep->register_window(t.s.mem.data(), t.s.mem.size(), &w));
+  t.s.tok = *parse_token(t.s.ep->window_token(w, 0, t.s.mem.size()));
+  ASSERT_TRUE(t.connect());
+  std::vector<int> rc(8, 1);
+  std::vector<std::thread> ts;
+  for (int i = 0; i < 8; i++) {
+    ts.emplace_back([&, i] {
+      who = i;
+      rc[i] = t.write(i, ms(400 + 100 * i));
+    });
+  }
+  for (auto& th : ts) {
+    th.join();
+  }
+  for (int i = 0; i < 8; i++) {
+    EXPECT_EQ(-ETIMEDOUT, rc[i]) << "writer " << i;
+  }
+  const auto st = t.writer->stats();
+  EXPECT_FALSE(st.unsafe) << t.writer->last_error();
+  EXPECT_EQ(8u, st.plans_cut_off);
+  EXPECT_EQ(0u, st.resets);
+  EXPECT_LT(st.max_cutoff_lateness_ms, 1000u);
 }
 
 TEST(OfiCutOffFails, Tcp)
@@ -927,7 +1092,8 @@ TEST(OfiCutOffLate, Tcp)
   // turns unsafe. A write whose budget the cut-off still met is merely
   // cancelled.
   stalled_t t;
-  if (!t.open([] { std::this_thread::sleep_for(ms(400)); return 0; })) {
+  if (!t.open([] { std::this_thread::sleep_for(ms(400)); return 0; },
+	      [](config_t& c) { c.late_tolerance = ms(200); })) {
     GTEST_SKIP() << "tcp is not available";
   }
   std::atomic<int> r0{1}, r1{1};
@@ -1212,7 +1378,7 @@ TEST(OfiPeerLimits, DestroyWithInsertsPending)
     GTEST_SKIP() << "tcp is not available";
   }
   for (int i = 0; i < 6; i++) {
-    EXPECT_EQ(-ETIMEDOUT, t.write(i, ms(150)));
+    EXPECT_EQ(-ETIMEDOUT, t.write(i, ms(250)));
   }
   EXPECT_EQ(6u, t.writer->stats().pending_inserts);
   ASSERT_TRUE(gate->wait_total(1, ms(5000)));

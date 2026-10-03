@@ -87,6 +87,19 @@ struct config_t {
   /// ends after the budget it protects: see write().
   std::chrono::milliseconds cutoff_cost_initial{100};
   std::chrono::milliseconds cutoff_cost_max{2000};
+  /// A cut-off that ends after the budget it protects, by no more than
+  /// this, and that itself took no longer, is counted (cutoffs_late) and
+  /// the endpoint goes on; one beyond it makes the endpoint unsafe. A cut-
+  /// off is usually late because the thread that should start it was not
+  /// running: a loaded host, a scheduling delay. Those who wait for an
+  /// OSD's reply are not affected, since the reply follows the cut-off;
+  /// a client that gave a request up must allow this much beyond the
+  /// pool's lease and drain.
+  std::chrono::milliseconds late_tolerance{1000};
+  /// for tests: runs in a waiting write, without the endpoint's lock,
+  /// each time it wakes, with the time it is to cut its writes off; a
+  /// test sleeps in it to stand for a writer the scheduler left idle
+  std::function<void(std::chrono::steady_clock::time_point)> wait_hook;
   /// how long a memory key that left service (see rekey_window()) is not
   /// accepted again for a window: the longest a packet can stay in the
   /// network. A provider that reuses keys, as the UET reference provider
@@ -217,6 +230,15 @@ public:
    * Too little is less than 1 ms beyond twice the time recent writes of
    * 1 MiB or more took for as many bytes.
    *
+   * A write stops waiting, and cuts its writes off, ahead of its budget's
+   * end by what a cut-off is expected to cost plus a scheduling slack,
+   * learned from how late cut-offs actually started. Any thread that
+   * polls the endpoint cuts off every write whose time has come, on its
+   * writer's behalf, so a writer the scheduler left idle is cut off in
+   * time anyway. A cut-off that still ends after the budget, within
+   * config_t::late_tolerance, is counted and the write returns
+   * -ETIMEDOUT; beyond it, -ENOTRECOVERABLE.
+   *
    * The first write to a peer adds it to the address vector. Some
    * providers take long for that: the UET reference provider waits for
    * the peer's next hop to resolve, for up to a second, and older
@@ -265,7 +287,17 @@ public:
     /// cut-offs whose close failed, and cut-offs that ended after a
     /// budget they protected
     uint64_t cutoffs_failed = 0;
+    /// cut-offs that ended after the budget they protected, within
+    /// late_tolerance or not; the worst lateness, and when the last one
+    /// was; cut-offs done on a waiting writer's behalf by another thread
     uint64_t cutoffs_late = 0;
+    uint64_t max_cutoff_lateness_ms = 0;
+    std::chrono::steady_clock::time_point last_late_cutoff{};
+    uint64_t cutoffs_on_behalf = 0;
+    /// the scheduling slack a write keeps ahead of its budget's end, on
+    /// top of cutoff_cost_ms, and the tolerance
+    uint64_t cutoff_slack_ms = 0;
+    uint64_t late_tolerance_ms = 0;
     /// late writes cut off one by one, by cancelling their operations; and
     /// cancels that failed, after which the endpoint was reset instead
     uint64_t plans_cut_off = 0;
