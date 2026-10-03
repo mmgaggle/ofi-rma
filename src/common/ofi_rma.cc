@@ -21,6 +21,7 @@
 #include <map>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 
 #include <poll.h>
 
@@ -50,6 +51,8 @@ constexpr std::chrono::seconds INSERT_RETRY{1};
 constexpr std::chrono::microseconds SPIN_TIME{200};
 constexpr std::chrono::microseconds WAIT_SLEEP{50};
 constexpr std::chrono::microseconds POLL_BUSY_MARGIN{2};
+/// registrations a window may go through for a key out of quarantine
+constexpr int REKEY_ATTEMPTS = 8;
 /// the least time a write must have left to post; see write()
 constexpr std::chrono::milliseconds POST_MARGIN{1};
 /// plans this large or larger teach the endpoint how fast plans move;
@@ -218,6 +221,17 @@ struct Endpoint::Impl {
   std::map<uint64_t, region_t> windows;
   std::atomic<uint64_t> nwindows{0};  ///< windows.size(), readable without mtx
   uint64_t next_window = 0;
+  /// keys of windows' regions that left service, until when each is in
+  /// quarantine: not accepted again for a window
+  std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> retired;
+  std::deque<std::pair<std::chrono::steady_clock::time_point, uint64_t>>
+    retired_order;
+  std::atomic<uint64_t> windows_rekeyed{0};
+  std::atomic<uint64_t> key_collisions{0};
+  /// register a window's memory, under a key out of quarantine
+  int reg_window_locked(char* ptr, size_t len, region_t* out);
+  /// close a window's region, and put its key in quarantine
+  int close_window_region_locked(region_t& r);
 
   char* stage = nullptr;
   region_t stage_mr;
@@ -429,6 +443,50 @@ int Endpoint::Impl::reg(char* ptr, size_t len, uint64_t access, region_t* out)
     return -EOPNOTSUPP;
   }
   *out = region_t{mr, ptr, len, key, fi_mr_desc(mr)};
+  return 0;
+}
+
+int Endpoint::Impl::reg_window_locked(char* ptr, size_t len, region_t* out)
+{
+  const auto now = std::chrono::steady_clock::now();
+  while (!retired_order.empty() && retired_order.front().first <= now) {
+    const auto [until, key] = retired_order.front();
+    retired_order.pop_front();
+    if (auto it = retired.find(key); it != retired.end() && it->second == until) {
+      retired.erase(it);
+    }
+  }
+  for (int attempt = 0; attempt < REKEY_ATTEMPTS; attempt++) {
+    region_t fresh;
+    if (int r = reg(ptr, len, FI_REMOTE_WRITE, &fresh); r < 0) {
+      return r;
+    }
+    if (!retired.count(fresh.key)) {
+      *out = fresh;
+      return 0;
+    }
+    // a late write may still carry this key: drop it, and the provider
+    // gives another
+    key_collisions++;
+    fi_close(&fresh.mr->fid);
+  }
+  set_err("the provider kept giving memory keys still in quarantine");
+  return -EAGAIN;
+}
+
+int Endpoint::Impl::close_window_region_locked(region_t& r)
+{
+  if (!r.mr) {
+    return 0;
+  }
+  if (int e = fi_close(&r.mr->fid); e) {
+    set_err("closing a window's region: " + fi_err(e));
+    return to_errno(e);
+  }
+  const auto until = std::chrono::steady_clock::now() + cfg.key_quarantine;
+  retired[r.key] = until;
+  retired_order.emplace_back(until, r.key);
+  r.mr = nullptr;
   return 0;
 }
 
@@ -824,10 +882,7 @@ void Endpoint::Impl::reset_locked()
   const bool rebind = mr_mode & FI_MR_ENDPOINT;
   if (rebind) {
     for (auto& [id, w] : windows) {
-      if (w.mr) {
-	fi_close(&w.mr->fid);
-	w.mr = nullptr;
-      }
+      close_window_region_locked(w);
     }
     if (stage_mr.mr) {
       fi_close(&stage_mr.mr->fid);
@@ -843,7 +898,7 @@ void Endpoint::Impl::reset_locked()
   if (rebind) {
     for (auto& [id, w] : windows) {
       region_t fresh;
-      if (reg(w.ptr, w.len, FI_REMOTE_WRITE, &fresh) < 0) {
+      if (reg_window_locked(w.ptr, w.len, &fresh) < 0) {
         broken = true;
         return;
       }
@@ -932,6 +987,17 @@ std::unique_ptr<Endpoint> Endpoint::open(const config_t& cfg, std::string* err)
     }
     if (r != -FI_ENODATA) {
       break;
+    }
+  }
+  if (!r && cfg.mr_cnt && d->info->domain_attr->mr_cnt &&
+      d->info->domain_attr->mr_cnt < cfg.mr_cnt) {
+    // a provider with a fixed table of regions: ask for a larger one,
+    // with the same attributes, and keep what it gave if it will not
+    hints->domain_attr->mr_cnt = cfg.mr_cnt;
+    fi_info* bigger = nullptr;
+    if (fi_getinfo(API_VERSION, node, service, flags, hints, &bigger) == 0) {
+      fi_freeinfo(d->info);
+      d->info = bigger;
     }
   }
   fi_freeinfo(hints);
@@ -1046,7 +1112,7 @@ int Endpoint::register_window(char* ptr, size_t len, window_t* out)
   auto& d = *impl;
   std::lock_guard l(d.mtx);
   Impl::region_t reg;
-  if (int r = d.reg(ptr, len, FI_REMOTE_WRITE, &reg); r < 0) {
+  if (int r = d.reg_window_locked(ptr, len, &reg); r < 0) {
     return r;
   }
   const uint64_t id = d.next_window++;
@@ -1064,11 +1130,37 @@ void Endpoint::deregister_window(uint64_t id)
   if (it == d.windows.end()) {
     return;
   }
-  if (it->second.mr) {
-    fi_close(&it->second.mr->fid);
-  }
+  d.close_window_region_locked(it->second);
   d.windows.erase(it);
   d.nwindows = d.windows.size();
+}
+
+int Endpoint::rekey_window(const window_t& w)
+{
+  auto& d = *impl;
+  std::lock_guard l(d.mtx);
+  if (d.broken) {
+    return -EIO;
+  }
+  auto it = d.windows.find(w.id);
+  if (it == d.windows.end() || !it->second.mr) {
+    return -ENOENT;
+  }
+  Impl::region_t& cur = it->second;
+  // the new region first, while the old one still holds its key, so the
+  // provider cannot hand the old key straight back
+  Impl::region_t fresh;
+  if (int r = d.reg_window_locked(cur.ptr, cur.len, &fresh); r < 0) {
+    return r;
+  }
+  if (int r = d.close_window_region_locked(cur); r < 0) {
+    // the old key still works; keep the window as it was
+    fi_close(&fresh.mr->fid);
+    return r;
+  }
+  cur = fresh;
+  d.windows_rekeyed++;
+  return 0;
 }
 
 std::string Endpoint::window_token(const window_t& w, uint64_t ofs,
@@ -1346,6 +1438,8 @@ Endpoint::stats_t Endpoint::stats() const
   s.budget_refused = d.budget_refused;
   s.cutoff_cost_ms = d.cutoff_cost_ms;
   s.late_starts = d.late_starts;
+  s.windows_rekeyed = d.windows_rekeyed;
+  s.key_collisions = d.key_collisions;
   s.unsafe = d.unsafe;
   s.broken = d.broken;
   s.windows = d.nwindows;

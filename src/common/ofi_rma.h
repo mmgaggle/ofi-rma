@@ -86,6 +86,15 @@ struct config_t {
   /// ends after the budget it protects: see write().
   std::chrono::milliseconds cutoff_cost_initial{100};
   std::chrono::milliseconds cutoff_cost_max{2000};
+  /// how long a memory key that left service (see rekey_window()) is not
+  /// accepted again for a window: the longest a packet can stay in the
+  /// network. A provider that reuses keys, as the UET reference provider
+  /// does, could otherwise give a late write's key to another window.
+  std::chrono::milliseconds key_quarantine{10000};
+  /// memory regions to ask a provider for when it offers fewer. Keys in
+  /// quarantine hold their place in a provider that reuses them, so this
+  /// bounds re-keys to about mr_cnt per key_quarantine.
+  size_t mr_cnt = 16384;
   /// for tests: runs on the insert thread just before each
   /// fi_av_insert(), with the peer's name, under the same locks
   std::function<void(const std::string&)> insert_hook;
@@ -126,6 +135,17 @@ public:
   /// register [ptr, ptr+len) for remote writes
   int register_window(char* ptr, size_t len, window_t* out);
   void deregister_window(uint64_t id);
+  /**
+   * Give a window a new memory key before its memory is reused for
+   * another operation. Every token issued for it before stops working: a
+   * write that still carries the old key fails instead of landing, as a
+   * late duplicate of a write that completed long ago can over a provider
+   * that retransmits without connection state (UET's RUDI). Call it only
+   * when no write of the window's current operation is still expected.
+   * Returns 0, or a negative errno with the window and its key unchanged;
+   * do not reuse the memory then until key_quarantine has passed.
+   */
+  int rekey_window(const window_t& w);
   /// the token naming [ofs, ofs+len) of a registered window
   std::string window_token(const window_t& w, uint64_t ofs, uint64_t len) const;
 
@@ -209,6 +229,10 @@ public:
     /// writes that did not start, with nothing sent, because too little
     /// of their budget was left to post them
     uint64_t late_starts = 0;
+    /// windows given a new key, and keys a provider handed out again
+    /// while still in quarantine, which were dropped
+    uint64_t windows_rekeyed = 0;
+    uint64_t key_collisions = 0;
     bool unsafe = false;
     /// takes no more writes: unsafe, or a cut-off could not reopen it
     bool broken = false;

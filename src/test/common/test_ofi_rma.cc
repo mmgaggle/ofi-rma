@@ -10,6 +10,8 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <set>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -755,6 +757,91 @@ TEST(OfiCutOffLate, Tcp)
   EXPECT_EQ(0u, st.cutoffs_failed);
   EXPECT_EQ(-EIO, t.write(2, ms(2000)));
 }
+
+class OfiRekey : public ::testing::TestWithParam<std::pair<const char*, const char*>> {};
+
+TEST_P(OfiRekey, OldTokenStopsWorking)
+{
+  // a window given a new key takes no write that carries the old one: a
+  // late duplicate of a write that completed before the window was reused
+  // must not land in it
+  auto [prov, node] = GetParam();
+  auto gate = std::make_shared<gate_t>();
+  window_owner_t a;
+  a.ep = open_target(prov, node);
+  auto writer = open_writer(prov, node, true, 1 << 20, 2, gate);
+  if (!a.ep || !writer) {
+    GTEST_SKIP() << prov << " is not available";
+  }
+  const size_t N = 1 << 20;
+  a.mem.assign(N, 0);
+  Endpoint::window_t w;
+  ASSERT_EQ(0, a.ep->register_window(a.mem.data(), N, &w));
+  auto t1 = parse_token(a.ep->window_token(w, 0, N));
+  ASSERT_TRUE(t1);
+  std::vector<char> src(N, 'o');
+  iovec iov{src.data(), N};
+  std::vector<Endpoint::write_t> all = {{0, N, 0}};
+  ASSERT_EQ(0, writer->write(*t1, &iov, 1, all, BUDGET)) << writer->last_error();
+
+  // the window is reused: new key, then new contents
+  ASSERT_EQ(0, a.ep->rekey_window(w)) << a.ep->last_error();
+  auto t2 = parse_token(a.ep->window_token(w, 0, N));
+  ASSERT_TRUE(t2);
+  EXPECT_NE(t1->key, t2->key);
+  EXPECT_EQ(1u, a.ep->stats().windows_rekeyed);
+  a.ep->sync();
+  std::fill(a.mem.begin(), a.mem.end(), 'n');
+
+  // a write with the old key fails, and nothing of it lands
+  std::vector<char> late(N, 'L');
+  iovec liov{late.data(), N};
+  EXPECT_NE(0, writer->write(*t1, &liov, 1, all, BUDGET));
+  a.ep->sync();
+  EXPECT_EQ(std::string::npos,
+	    std::string_view(a.mem.data(), N).find('L'));
+  // the new key works
+  EXPECT_EQ(0, writer->write(*t2, &iov, 1, all, BUDGET)) << writer->last_error();
+  a.ep->sync();
+  EXPECT_EQ(0, memcmp(a.mem.data(), src.data(), N));
+}
+
+TEST_P(OfiRekey, KeysDoNotRepeat)
+{
+  // many re-keys of one window, and of a window that comes and goes:
+  // no key is given out twice while in quarantine
+  auto [prov, node] = GetParam();
+  window_owner_t a;
+  a.ep = open_target(prov, node);
+  if (!a.ep) {
+    GTEST_SKIP() << prov << " is not available";
+  }
+  ASSERT_TRUE(lend(a, 1 << 20));
+  Endpoint::window_t w;
+  ASSERT_EQ(0, a.ep->register_window(a.mem.data(), 4096, &w));
+  std::set<uint64_t> keys;
+  for (int i = 0; i < 200; i++) {
+    auto t = parse_token(a.ep->window_token(w, 0, 4096));
+    ASSERT_TRUE(t);
+    EXPECT_TRUE(keys.insert(t->key).second) << "key " << t->key << " again";
+    ASSERT_EQ(0, a.ep->rekey_window(w)) << a.ep->last_error();
+  }
+  std::vector<char> other(4096);
+  for (int i = 0; i < 50; i++) {
+    Endpoint::window_t x;
+    ASSERT_EQ(0, a.ep->register_window(other.data(), other.size(), &x));
+    auto t = parse_token(a.ep->window_token(x, 0, other.size()));
+    ASSERT_TRUE(t);
+    EXPECT_TRUE(keys.insert(t->key).second) << "key " << t->key << " again";
+    a.ep->deregister_window(x.id);
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  Providers, OfiRekey,
+  ::testing::Values(std::make_pair("tcp", "127.0.0.1"),
+		    std::make_pair("shm", "")),
+  [](const auto& info) { return std::string(info.param.first); });
 
 TEST(OfiLateStart, DoesNotCutOffOthers)
 {
