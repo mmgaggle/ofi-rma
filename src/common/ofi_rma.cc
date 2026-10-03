@@ -352,7 +352,9 @@ Endpoint::Impl::~Impl()
   // which no write references the regions
   if (ep) fi_close(&ep->fid);
   for (auto& [id, w] : windows) {
-    fi_close(&w.mr->fid);
+    // a window loses its region when re-registering it after a cut-off
+    // failed
+    if (w.mr) fi_close(&w.mr->fid);
   }
   if (stage_mr.mr) fi_close(&stage_mr.mr->fid);
   std::free(stage);
@@ -740,8 +742,10 @@ void Endpoint::Impl::reset_locked()
   const bool rebind = mr_mode & FI_MR_ENDPOINT;
   if (rebind) {
     for (auto& [id, w] : windows) {
-      fi_close(&w.mr->fid);
-      w.mr = nullptr;
+      if (w.mr) {
+	fi_close(&w.mr->fid);
+	w.mr = nullptr;
+      }
     }
     if (stage_mr.mr) {
       fi_close(&stage_mr.mr->fid);
@@ -958,7 +962,9 @@ void Endpoint::deregister_window(uint64_t id)
   if (it == d.windows.end()) {
     return;
   }
-  fi_close(&it->second.mr->fid);
+  if (it->second.mr) {
+    fi_close(&it->second.mr->fid);
+  }
   d.windows.erase(it);
   d.nwindows = d.windows.size();
 }
@@ -969,7 +975,7 @@ std::string Endpoint::window_token(const window_t& w, uint64_t ofs,
   auto& d = *impl;
   std::lock_guard l(d.mtx);
   auto it = d.windows.find(w.id);
-  if (it == d.windows.end() || ofs + len > it->second.len) {
+  if (it == d.windows.end() || !it->second.mr || ofs + len > it->second.len) {
     return {};
   }
   token_t t;
