@@ -139,6 +139,15 @@ struct config_t {
   /// first: once an insert has held the endpoint this long, calls give
   /// up on it at once. An insert quicker than this refuses nothing.
   std::chrono::milliseconds insert_wait{10};
+  /// On a FI_THREAD_DOMAIN domain, how long after a WindowPool lent a
+  /// window an insert waits for it to come back before it stops the
+  /// endpoint, polling meanwhile. A provider that places data only while
+  /// polled places none during the insert, so a peer pushing into the
+  /// window would wait for the insert, holding its own op thread, until
+  /// its push is cut off. Pushes into a window come until about this long
+  /// after it was lent: for an OSD, the pool's lease plus drain. 0 waits
+  /// for no window.
+  std::chrono::milliseconds lent_wait{0};
   /// for tests: runs on the insert thread just before each
   /// fi_av_insert(), with the peer's name, under the same locks
   std::function<void(const std::string&)> insert_hook;
@@ -291,19 +300,21 @@ public:
    * that offers only FI_THREAD_DOMAIN allows no other call during the
    * insert, and has the inserts run one at a time: the insert waits
    * until the writes in flight are done, so none of them misses its
-   * cut-off, and then holds the endpoint until the provider returns. A
-   * write that starts meanwhile, to any peer, and a write whose new
-   * peer is not ready, its own insert running or queued behind others,
-   * wait for an insert at most config_t::insert_wait, not for their
-   * budgets, since their caller, an OSD op thread say, has other work
-   * queued behind it, and then return -EBUSY, having sent nothing.
-   * window_token(), rekey_window() and sync() wait as long for an
-   * insert in the provider and go on without the endpoint (see each);
-   * quiet() says when an insert keeps it quiet. progress(), the window
-   * registrations, and a progress thread that places incoming data,
-   * wait for the insert. A first write to a new peer returns -EBUSY at
-   * once, having sent nothing, when max_pending_inserts are already
-   * under way, or when max_peers are known and all of them are in use.
+   * cut-off, and for the windows a WindowPool lent (see
+   * config_t::lent_wait), and then holds the endpoint until the
+   * provider returns. A write that starts meanwhile, to any peer, and a
+   * write whose new peer is not ready, its own insert running or queued
+   * behind others, wait for an insert at most config_t::insert_wait,
+   * not for their budgets, since their caller, an OSD op thread say,
+   * has other work queued behind it, and then return -EBUSY, having
+   * sent nothing. window_token(), rekey_window() and sync() wait as
+   * long for an insert in the provider and go on without the endpoint
+   * (see each); quiet() says when an insert keeps it quiet. progress(),
+   * the window registrations, and a progress thread that places
+   * incoming data, wait for the insert. A first write to a new peer
+   * returns -EBUSY at once, having sent nothing, when
+   * max_pending_inserts are already under way, or when max_peers are
+   * known and all of them are in use.
    */
   int write(const token_t& dst, const struct iovec* iov, size_t iovcnt,
 	    const std::vector<write_t>& writes,
@@ -320,6 +331,10 @@ public:
   /// an insert on a FI_THREAD_DOMAIN domain keeps the endpoint quiet: it
   /// waits for the writes in flight, or runs, and no write starts
   bool quiet() const;
+  /// for a WindowPool: when the latest of its windows still lent was
+  /// lent, or the clock's epoch when none is. An insert on a
+  /// FI_THREAD_DOMAIN domain waits until config_t::lent_wait after it.
+  void windows_lent(std::chrono::steady_clock::time_point latest);
 
   struct stats_t {
     uint64_t writes_posted = 0;
@@ -424,7 +439,9 @@ private:
  * Neither lending nor returning a window waits for an insert on a
  * FI_THREAD_DOMAIN domain: no window is lent while one keeps the
  * endpoint quiet, and a window returned meanwhile gets its new key from
- * an acquire() after it.
+ * an acquire() after it. Such an insert waits for the windows lent
+ * before it to come back, within config_t::lent_wait, so that the pushes
+ * into them land first.
  */
 class WindowPool {
 public:
@@ -491,7 +508,11 @@ private:
     /// re-keyed, and then quarantined this long
     bool rekey_due = false;
     std::chrono::milliseconds due_quarantine{0};
+    /// when it was lent; the epoch when it is not
+    std::chrono::steady_clock::time_point lent_at{};
   };
+  /// tell the endpoint when the latest window still lent was lent
+  void note_lent_locked();
   /// re-key a window whose re-key an insert put off; without mtx
   void rekey_put_off();
   /// a window back from use, re-keyed with result r when rekey

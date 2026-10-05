@@ -784,6 +784,130 @@ TEST(OfiPeerInsertDomain, FirstContactsDoNotQueue)
   EXPECT_EQ(2u, writer->stats().insert_busy);
 }
 
+TEST(OfiPeerInsertDomain, LentWindowsFillFirst)
+{
+  // FI_THREAD_DOMAIN, on an endpoint that lends gather windows, as an
+  // OSD's does. Nothing polls it during an insert, so an insert waits for
+  // the windows lent before it to come back, polling meanwhile: a shard's
+  // push into one lands, instead of waiting for the insert. A window kept
+  // out longer holds an insert up only until lent_wait after its lending.
+  auto gate = std::make_shared<gate_t>();
+  window_owner_t a, b;
+  a.ep = open_target("tcp", "127.0.0.1");
+  b.ep = open_target("tcp", "127.0.0.1");
+  const size_t W = 64 << 10;
+  std::vector<char> mem(2 * W, 0);
+  config_t c;
+  c.provider = "tcp";
+  c.node = "127.0.0.1";
+  c.thread_safe = false;
+  c.stage_size = W;
+  c.stage_count = 2;
+  c.progress_thread = true;
+  c.lent_wait = ms(1500);
+  c.insert_hook = [gate](const std::string& name) { gate->enter(name); };
+  std::string err;
+  auto osd = Endpoint::open(c, &err);
+  // a shard, pushing into the windows
+  auto shard = open_writer("tcp", "127.0.0.1", true, W, 2,
+			   std::make_shared<gate_t>());
+  if (!a.ep || !b.ep || !osd || !shard) {
+    GTEST_SKIP() << "tcp is not available: " << err;
+  }
+  ASSERT_TRUE(lend(a, W));
+  ASSERT_TRUE(lend(b, W));
+  auto pool = WindowPool::create(*osd, mem.data(), W, 2, &err);
+  ASSERT_TRUE(pool) << err;
+  std::vector<char> src(W, 's');
+  iovec iov{src.data(), W};
+  std::vector<Endpoint::write_t> all = {{0, W, 0}};
+
+  // the shard knows this endpoint from an earlier push: its own first
+  // contact is not what this test times
+  {
+    auto warm = pool->acquire(W);
+    ASSERT_TRUE(warm);
+    const auto tok = *parse_token(warm->token);
+    int r = -EBUSY;
+    for (int i = 0; i < 100 && r == -EBUSY; i++) {
+      if ((r = shard->write(tok, &iov, 1, all, BUDGET)) == -EBUSY) {
+	std::this_thread::sleep_for(ms(10));
+      }
+    }
+    ASSERT_EQ(0, r) << shard->last_error();
+    pool->release(warm->id, ms(0), true);
+  }
+
+  // a gather lends a window; then a first contact with A
+  auto lent = pool->acquire(W);
+  ASSERT_TRUE(lent);
+  gate->hold = a.tok.name;
+  std::thread backstop([gate] {
+    {
+      std::unique_lock l(gate->m);
+      gate->cv.wait_for(l, ms(8000), [&] { return gate->open; });
+    }
+    gate->release();
+  });
+  EXPECT_EQ(-EBUSY, osd->write(a.tok, &iov, 1, all, ms(20000)));
+  const auto until = clk::now() + ms(1000);
+  while (!osd->quiet() && clk::now() < until) {
+    std::this_thread::sleep_for(ms(1));
+  }
+  EXPECT_TRUE(osd->quiet());
+
+  // the insert waits for the window, and the shard's push into it lands
+  std::this_thread::sleep_for(ms(100));
+  EXPECT_EQ(0, gate->count(a.tok.name));
+  auto t0 = clk::now();
+  EXPECT_EQ(0, shard->write(*parse_token(lent->token), &iov, 1, all, BUDGET))
+    << shard->last_error();
+  EXPECT_LT(clk::now() - t0, ms(500));
+  osd->sync();
+  EXPECT_EQ(0, memcmp(lent->ptr, src.data(), W));
+  EXPECT_EQ(0, gate->count(a.tok.name));
+
+  // the gather returns it, and the insert goes on at once
+  const auto back = clk::now();
+  pool->release(lent->id, ms(0), true);
+  EXPECT_TRUE(gate->wait_held(ms(5000)));
+  {
+    std::lock_guard l(gate->m);
+    EXPECT_GE(gate->held_at, back);
+    EXPECT_LT(gate->held_at - back, ms(250));
+  }
+  gate->release();
+  backstop.join();
+  ASSERT_TRUE(settled(*osd, ms(5000)));
+
+  // a window kept out: the next insert waits for it until lent_wait after
+  // it was lent, and no longer
+  auto kept = pool->acquire(W);
+  ASSERT_TRUE(kept);
+  const auto kept_at = clk::now();
+  {
+    std::lock_guard l(gate->m);
+    gate->hold = b.tok.name;
+  }
+  EXPECT_EQ(-EBUSY, osd->write(b.tok, &iov, 1, all, ms(20000)));
+  ASSERT_TRUE(gate->wait_held(ms(5000)));
+  {
+    std::lock_guard l(gate->m);
+    EXPECT_GE(gate->held_at - kept_at, c.lent_wait - ms(50));
+    EXPECT_LT(gate->held_at - kept_at, c.lent_wait + ms(1000));
+  }
+  pool->release(kept->id, ms(0), true);
+  ASSERT_TRUE(settled(*osd, ms(5000)));
+
+  // and both peers take writes
+  EXPECT_EQ(0, osd->write(a.tok, &iov, 1, all, BUDGET)) << osd->last_error();
+  EXPECT_EQ(0, osd->write(b.tok, &iov, 1, all, BUDGET)) << osd->last_error();
+  a.ep->sync();
+  b.ep->sync();
+  EXPECT_EQ(0, memcmp(a.mem.data(), src.data(), W));
+  EXPECT_EQ(0, memcmp(b.mem.data(), src.data(), W));
+}
+
 namespace {
 
 /// CPU time this process used so far, user and system

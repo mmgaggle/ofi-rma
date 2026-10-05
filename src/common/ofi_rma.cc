@@ -238,6 +238,9 @@ struct Endpoint::Impl {
   /// set while such an insert is in the provider, holding mtx: nothing
   /// else calls into the domain, or polls it, until it returns
   std::atomic<bool> inserting{false};
+  /// when the latest window a WindowPool still has lent was lent, steady
+  /// clock, since its epoch; 0 when none is
+  std::atomic<int64_t> lent_ns{0};
   /// calls that went on without the endpoint, or a write without its new
   /// peer, after cfg.insert_wait for an insert
   std::atomic<uint64_t> insert_busy{0};
@@ -922,17 +925,28 @@ void Endpoint::Impl::insert_peer(const std::string& name)
     // finish first, within their budgets, so that the insert delays
     // none of their cut-offs; writes that start meanwhile, and calls
     // that cannot get mtx while it is in the provider, wait for it no
-    // longer than insert_give_up().
+    // longer than insert_give_up(). Let the windows lent before it come
+    // back too, within cfg.lent_wait of their lending, polling so that
+    // the peers' pushes into them land: nothing polls during the insert,
+    // and a peer pushing meanwhile would wait for it.
     l.lock();
     quiet_since_ns =
       std::chrono::steady_clock::now().time_since_epoch().count();
     quiesce = true;
-    while (!plans.empty() && !stopping) {
+    auto busy = [this] {
+      if (!plans.empty()) {
+	return true;
+      }
+      const int64_t lent = lent_ns;
+      return lent && std::chrono::steady_clock::now() <
+	time_point(std::chrono::steady_clock::duration(lent)) + cfg.lent_wait;
+    };
+    while (busy() && !stopping) {
       // reap completions: the writers may all be waiting for the endpoint
       // now, and a plan whose writer left after cancelling it waits for
       // its cancellations to complete
       poll_locked();
-      if (plans.empty()) {
+      if (!busy()) {
 	break;
       }
       l.unlock();
@@ -2080,6 +2094,11 @@ bool Endpoint::quiet() const
   return impl->quiesce;
 }
 
+void Endpoint::windows_lent(std::chrono::steady_clock::time_point latest)
+{
+  impl->lent_ns = latest.time_since_epoch().count();
+}
+
 Endpoint::stats_t Endpoint::stats() const
 {
   auto& d = *impl;
@@ -2164,6 +2183,7 @@ std::unique_ptr<WindowPool> WindowPool::create(Endpoint& ep, char* mem,
 
 WindowPool::~WindowPool()
 {
+  ep.windows_lent({});
   for (auto& s : slots) {
     ep.deregister_window(s.w.id);
   }
@@ -2193,16 +2213,26 @@ std::optional<WindowPool::lent_t> WindowPool::acquire(size_t size)
       continue;
     }
     std::string token = ep.window_token(s.w, 0, slot_size);
+    if (!token.empty()) {
+      // lent from here, for an insert that begins now to wait for
+      s.in_use = true;
+      s.lent_at = std::chrono::steady_clock::now();
+      note_lent_locked();
+    }
     if (ep.quiet()) {
       // an insert began meanwhile, and the token may have been made while
       // it waited for the writes in flight: no window is lent once one has
+      if (s.in_use) {
+	s.in_use = false;
+	s.lent_at = {};
+	note_lent_locked();
+      }
       st.declined_insert++;
       return std::nullopt;
     }
     if (token.empty()) {
       return std::nullopt;  // the endpoint lends no more
     }
-    s.in_use = true;
     st.acquired++;
     return lent_t{i, s.w.ptr, slot_size, std::move(token)};
   }
@@ -2227,6 +2257,10 @@ void WindowPool::release(uint64_t id, std::chrono::milliseconds quarantine,
   std::lock_guard l(mtx);
   auto& s = slots[id];
   s.in_use = false;
+  if (s.lent_at != std::chrono::steady_clock::time_point{}) {
+    s.lent_at = {};
+    note_lent_locked();
+  }
   if (r == -EINPROGRESS) {
     // an acquire() that finds the endpoint free re-keys it, and
     // the window is not lent before
@@ -2264,6 +2298,15 @@ void WindowPool::rekey_put_off()
   s.rekey_due = false;
   rekeys_due--;
   settle_locked(s, s.due_quarantine, true, r);
+}
+
+void WindowPool::note_lent_locked()
+{
+  std::chrono::steady_clock::time_point latest{};
+  for (const auto& s : slots) {
+    latest = std::max(latest, s.lent_at);
+  }
+  ep.windows_lent(latest);
 }
 
 void WindowPool::settle_locked(slot_t& s, std::chrono::milliseconds quarantine,
