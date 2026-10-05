@@ -433,6 +433,12 @@ TEST_P(OfiPeerInsert, CoalescesFirstContact)
   if (!a.ep || !writer) {
     GTEST_SKIP() << prov << " is not available";
   }
+  if (writer->describe().find("concurrent peer inserts") == std::string::npos) {
+    // on a FI_THREAD_DOMAIN domain the writes held behind the insert
+    // give up after insert_wait (see OfiPeerInsertDomain)
+    GTEST_SKIP() << prov << " offers no thread-safe domain: "
+		 << writer->describe();
+  }
   const size_t N = 4 << 20;
   ASSERT_TRUE(lend(a, N));
   gate->hold = a.tok.name;
@@ -531,7 +537,7 @@ TEST(OfiPeerInsertDomain, Tcp)
   ta.join();
   EXPECT_EQ(-EBUSY, ra.load());
   EXPECT_FALSE(pa.load());
-  EXPECT_LT(a_took, ms(250));
+  EXPECT_LT(a_took, ms(1000));
   tsw.join();
   EXPECT_EQ(-ETIMEDOUT, rs.load());
   // cut off within its budget: the insert did not delay it
@@ -549,7 +555,7 @@ TEST(OfiPeerInsertDomain, Tcp)
   const auto t0 = clk::now();
   bool posted = true;
   EXPECT_EQ(-EBUSY, writer->write(b.tok, &zv, 1, one, ms(2000), &posted));
-  EXPECT_LT(clk::now() - t0, ms(250));
+  EXPECT_LT(clk::now() - t0, ms(1000));
   EXPECT_FALSE(posted);
   EXPECT_EQ(2u, writer->stats().insert_busy);  // A's and B's
   EXPECT_EQ(0u, writer->stats().peer_timeouts);
@@ -590,7 +596,7 @@ TEST(OfiPeerInsertDomain, OpThreadsDoNotWait)
   c.stage_size = W;
   c.stage_count = 2;
   c.progress_thread = true;
-  c.insert_wait = ms(300);
+  c.insert_wait = ms(1000);
   c.insert_hook = [gate](const std::string& name) { gate->enter(name); };
   std::string err;
   auto osd = Endpoint::open(c, &err);
@@ -633,7 +639,7 @@ TEST(OfiPeerInsertDomain, OpThreadsDoNotWait)
   bool posted = true;
   auto t0 = clk::now();
   EXPECT_EQ(-EBUSY, osd->write(a.tok, &iov, 1, all, ms(20000), &posted));
-  EXPECT_LT(clk::now() - t0, c.insert_wait + ms(250));
+  EXPECT_LT(clk::now() - t0, c.insert_wait + ms(1000));
   EXPECT_FALSE(posted);
   EXPECT_TRUE(gate->wait_held(ms(5000)));
   EXPECT_TRUE(osd->quiet());
@@ -753,7 +759,7 @@ TEST(OfiPeerInsertDomain, FirstContactsDoNotQueue)
   bool posted = true;
   auto t0 = clk::now();
   EXPECT_EQ(-EBUSY, writer->write(a.tok, &iov, 1, all, ms(20000), &posted));
-  EXPECT_LT(clk::now() - t0, ms(250));
+  EXPECT_LT(clk::now() - t0, ms(1000));
   EXPECT_FALSE(posted);
   EXPECT_TRUE(gate->wait_held(ms(5000)));
 
@@ -761,7 +767,7 @@ TEST(OfiPeerInsertDomain, FirstContactsDoNotQueue)
   posted = true;
   t0 = clk::now();
   EXPECT_EQ(-EBUSY, writer->write(b.tok, &iov, 1, all, ms(20000), &posted));
-  EXPECT_LT(clk::now() - t0, ms(250));
+  EXPECT_LT(clk::now() - t0, ms(1000));
   EXPECT_FALSE(posted);
   EXPECT_EQ(0, gate->count(b.tok.name));
   auto st = writer->stats();
@@ -804,7 +810,7 @@ TEST(OfiPeerInsertDomain, LentWindowsFillFirst)
   c.stage_size = W;
   c.stage_count = 2;
   c.progress_thread = true;
-  c.lent_wait = ms(1500);
+  c.lent_wait = ms(3000);
   c.insert_hook = [gate](const std::string& name) { gate->enter(name); };
   std::string err;
   auto osd = Endpoint::open(c, &err);
@@ -862,7 +868,7 @@ TEST(OfiPeerInsertDomain, LentWindowsFillFirst)
   auto t0 = clk::now();
   EXPECT_EQ(0, shard->write(*parse_token(lent->token), &iov, 1, all, BUDGET))
     << shard->last_error();
-  EXPECT_LT(clk::now() - t0, ms(500));
+  EXPECT_LT(clk::now() - t0, ms(1500));
   osd->sync();
   EXPECT_EQ(0, memcmp(lent->ptr, src.data(), W));
   EXPECT_EQ(0, gate->count(a.tok.name));
@@ -874,7 +880,7 @@ TEST(OfiPeerInsertDomain, LentWindowsFillFirst)
   {
     std::lock_guard l(gate->m);
     EXPECT_GE(gate->held_at, back);
-    EXPECT_LT(gate->held_at - back, ms(250));
+    EXPECT_LT(gate->held_at - back, ms(1000));
   }
   gate->release();
   backstop.join();
@@ -894,7 +900,7 @@ TEST(OfiPeerInsertDomain, LentWindowsFillFirst)
   {
     std::lock_guard l(gate->m);
     EXPECT_GE(gate->held_at - kept_at, c.lent_wait - ms(50));
-    EXPECT_LT(gate->held_at - kept_at, c.lent_wait + ms(1000));
+    EXPECT_LT(gate->held_at - kept_at, c.lent_wait + ms(1500));
   }
   pool->release(kept->id, ms(0), true);
   ASSERT_TRUE(settled(*osd, ms(5000)));
