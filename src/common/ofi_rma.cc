@@ -78,6 +78,9 @@ constexpr std::chrono::milliseconds POLLER_STALE{5};
 /// longest a write blocks on the completion queue's wait object before
 /// it looks again; bounds how late it notices a cut-off
 constexpr std::chrono::milliseconds WAIT_MAX{1};
+/// longest a call waiting for the endpoint lock blocks before it looks
+/// whether an insert on a FI_THREAD_DOMAIN domain is what holds it
+constexpr std::chrono::milliseconds QUIET_POLL{1};
 /// the API version asked for: old enough for a provider built against
 /// 1.x headers, new enough for FI_CONTEXT2 and the mr_mode bits used
 constexpr uint32_t API_VERSION = FI_VERSION(1, 18);
@@ -222,11 +225,22 @@ struct Endpoint::Impl {
   /// every libfabric call on this endpoint runs under this lock, except
   /// an address insert on a thread-safe domain, and so does every touch
   /// of the state below. Timed, so that a write waits for it only until
-  /// its deadline.
+  /// its deadline, and other calls only briefly while an insert holds it.
   mutable std::timed_mutex mtx;
   /// set while an insert on a FI_THREAD_DOMAIN domain waits for the
-  /// writes in flight to finish, and while it runs: no write starts
-  bool quiesce = false;
+  /// writes in flight to finish, and while it runs: no write starts.
+  /// Written under mtx; read without it by calls that wait for an insert
+  /// at most cfg.insert_wait.
+  std::atomic<bool> quiesce{false};
+  /// when quiesce was last set, steady clock, since its epoch; written
+  /// before it
+  std::atomic<int64_t> quiet_since_ns{0};
+  /// set while such an insert is in the provider, holding mtx: nothing
+  /// else calls into the domain, or polls it, until it returns
+  std::atomic<bool> inserting{false};
+  /// calls that went on without the endpoint, or a write without its new
+  /// peer, after cfg.insert_wait for an insert
+  std::atomic<uint64_t> insert_busy{0};
 
   struct region_t {
     fid_mr* mr = nullptr;
@@ -349,6 +363,10 @@ struct Endpoint::Impl {
   /// provider has nothing to do
   std::chrono::steady_clock::duration poll_floor =
     std::chrono::steady_clock::duration::max();
+  /// passes over the completion queue, each released when it is done:
+  /// sync() orders its caller's reads after them when an insert keeps it
+  /// from mtx
+  std::atomic<uint64_t> polls{0};
 
   std::thread progress_thr;
   std::atomic<bool> stopping{false};
@@ -469,9 +487,11 @@ struct Endpoint::Impl {
   void retire_locked(plan_t* p);
 
   using time_point = std::chrono::steady_clock::time_point;
-  /// the peer's address, waiting for its insert until deadline; takes a
-  /// reference, which put_peer() drops
-  int get_peer(const std::string& name, time_point deadline, fi_addr_t* out);
+  /// the peer's address, waiting for its insert until deadline, and on a
+  /// FI_THREAD_DOMAIN domain no longer than insert_give_up(start)
+  /// (-EBUSY); takes a reference, which put_peer() drops
+  int get_peer(const std::string& name, time_point deadline, time_point start,
+	       fi_addr_t* out);
   void put_peer(const std::string& name);
   /// an insert thread: removes evicted peers from the address vector
   /// and adds queued ones
@@ -485,10 +505,21 @@ struct Endpoint::Impl {
   void remove_peer(const std::string& name);
   /// add a queued peer to the address vector; without peer_mtx
   void insert_peer(const std::string& name);
-  /// take mtx for a write, unless the deadline passes first or an
-  /// insert on a FI_THREAD_DOMAIN domain keeps the endpoint quiet
-  bool lock_for_write(std::unique_lock<std::timed_mutex>& l,
-		      time_point deadline);
+  /// On a FI_THREAD_DOMAIN domain, when a call that began at start stops
+  /// waiting for an insert: cfg.insert_wait after it began, or after the
+  /// endpoint went quiet, whichever came first. Once an insert has held
+  /// the endpoint that long, a call gives up on it at once.
+  time_point insert_give_up(time_point start) const;
+  /// take mtx for a write that began at start, unless the deadline passes
+  /// first (-ETIMEDOUT) or an insert on a FI_THREAD_DOMAIN domain keeps
+  /// the endpoint quiet past insert_give_up(start) (-EBUSY)
+  int lock_for_write(std::unique_lock<std::timed_mutex>& l,
+		     time_point deadline, time_point start);
+  /// take mtx for a call other than a write: as long as that takes, but
+  /// no longer than insert_give_up() while an insert on a FI_THREAD_DOMAIN
+  /// domain is in the provider, which holds mtx for as long as it takes.
+  /// False, and counted, when that ran out.
+  bool lock_briefly(std::unique_lock<std::timed_mutex>& l);
 };
 
 Endpoint::Impl::~Impl()
@@ -661,14 +692,14 @@ size_t Endpoint::Impl::poll_locked()
 	}
       }
       if (n < 16) {
-	return got;
+	break;
       }
       continue;
     }
     if (n == -FI_EAVAIL) {
       fi_cq_err_entry e{};
       if (fi_cq_readerr(cq, &e, 0) < 0) {
-	return got;
+	break;
       }
       got++;
       const char* text = fi_cq_strerror(cq, e.prov_errno, e.err_data,
@@ -680,8 +711,10 @@ size_t Endpoint::Impl::poll_locked()
       }
       continue;
     }
-    return got;  // -FI_EAGAIN: nothing more, or an error with no entry
+    break;  // -FI_EAGAIN: nothing more, or an error with no entry
   }
+  // what a provider placed in this pass, for a sync() kept from mtx
+  polls.fetch_add(1, std::memory_order_release);
   return got;
 }
 
@@ -776,7 +809,7 @@ bool Endpoint::Impl::make_room_locked()
 }
 
 int Endpoint::Impl::get_peer(const std::string& name, time_point deadline,
-			     fi_addr_t* out)
+			     time_point start, fi_addr_t* out)
 {
   std::unique_lock pl(peer_mtx);
   if (stopping) {
@@ -810,13 +843,24 @@ int Endpoint::Impl::get_peer(const std::string& name, time_point deadline,
   // being removed is queued again once it is out
   p.refs++;
   p.used = now;
-  const bool settled = peer_cv.wait_until(pl, deadline, [&] {
+  // On a FI_THREAD_DOMAIN domain the inserts run one at a time, each
+  // stopping the endpoint for as long as the provider takes: the caller,
+  // an OSD op thread say, waits for its peer's no longer than for any
+  // other insert, and not behind those queued ahead of it. The insert
+  // goes on, so that a later write finds the peer ready.
+  const auto until = thread_safe ? deadline :
+    std::min(deadline, insert_give_up(start));
+  const bool settled = peer_cv.wait_until(pl, until, [&] {
     return stopping || p.state == peer_state::ready ||
       p.state == peer_state::failed;
   });
   if (!settled || p.state != peer_state::ready) {
     p.refs--;
     if (!settled) {
+      if (until < deadline) {
+	insert_busy++;
+	return -EBUSY;
+      }
       return -ETIMEDOUT;
     }
     return p.state == peer_state::failed ? p.err : -ESHUTDOWN;
@@ -876,8 +920,12 @@ void Endpoint::Impl::insert_peer(const std::string& name)
     // FI_THREAD_DOMAIN: no other call on the domain may run during the
     // insert, and the insert can take seconds. Let the writes in flight
     // finish first, within their budgets, so that the insert delays
-    // none of their cut-offs; writes that start meanwhile wait.
+    // none of their cut-offs; writes that start meanwhile, and calls
+    // that cannot get mtx while it is in the provider, wait for it no
+    // longer than insert_give_up().
     l.lock();
+    quiet_since_ns =
+      std::chrono::steady_clock::now().time_since_epoch().count();
     quiesce = true;
     while (!plans.empty() && !stopping) {
       // reap completions: the writers may all be waiting for the endpoint
@@ -895,10 +943,14 @@ void Endpoint::Impl::insert_peer(const std::string& name)
   fi_addr_t addr = FI_ADDR_NOTAVAIL;
   int r = broken ? -FI_EIO : -FI_ESHUTDOWN;
   if (!stopping && !broken) {
+    // on a FI_THREAD_DOMAIN domain nothing else runs from here until the
+    // provider returns
+    inserting = l.owns_lock();
     if (cfg.insert_hook) {
       cfg.insert_hook(name);
     }
     r = fi_av_insert(av, addr_buf, 1, &addr, 0, nullptr);
+    inserting = false;
   }
   if (r != 1) {
     set_err("fi_av_insert: " + (r < 0 ? fi_err(r) : std::string("rejected")));
@@ -953,25 +1005,79 @@ void Endpoint::Impl::insert_loop()
   }
 }
 
-bool Endpoint::Impl::lock_for_write(std::unique_lock<std::timed_mutex>& l,
-				    time_point deadline)
+Endpoint::Impl::time_point Endpoint::Impl::insert_give_up(
+  time_point start) const
 {
+  // timed per insert, not per call: under load, every call paying the
+  // whole wait would hold up the op threads all the same
+  auto from = start;
+  if (quiesce) {
+    from = std::min(from, time_point(std::chrono::steady_clock::duration(
+      quiet_since_ns.load())));
+  }
+  return from + cfg.insert_wait;
+}
+
+int Endpoint::Impl::lock_for_write(std::unique_lock<std::timed_mutex>& l,
+				   time_point deadline, time_point start)
+{
+  if (thread_safe) {
+    // inserts there run without mtx, and never keep the endpoint quiet
+    return l.try_lock_until(deadline) ? 0 : -ETIMEDOUT;
+  }
+  // An insert on a FI_THREAD_DOMAIN domain first waits for the writes in
+  // flight, then holds mtx for as long as the provider takes, seconds
+  // perhaps. The writer, an OSD op thread say, has other clients' work
+  // queued behind it: it waits for the insert only briefly, not for as
+  // long as its budget would allow, and the write is not made.
   while (true) {
-    if (!l.try_lock_until(deadline)) {
-      return false;
-    }
-    if (!quiesce) {
-      return true;
-    }
-    l.unlock();
     const auto now = std::chrono::steady_clock::now();
     if (now >= deadline) {
+      return -ETIMEDOUT;
+    }
+    if (quiesce) {
+      const auto give_up = insert_give_up(start);
+      if (now >= give_up) {
+	insert_busy++;
+	return -EBUSY;
+      }
+      std::this_thread::sleep_for(
+	std::min<std::chrono::steady_clock::duration>(
+	  {QUIET_POLL, give_up - now, deadline - now}));
+      continue;
+    }
+    // a slice at a time, to notice an insert that takes mtx meanwhile
+    if (l.try_lock_until(std::min(deadline, now + QUIET_POLL))) {
+      if (!quiesce) {
+	return 0;
+      }
+      l.unlock();
+    }
+  }
+}
+
+bool Endpoint::Impl::lock_briefly(std::unique_lock<std::timed_mutex>& l)
+{
+  if (thread_safe) {
+    l.lock();
+    return true;
+  }
+  const auto start = std::chrono::steady_clock::now();
+  while (!l.try_lock()) {
+    // only the insert itself holds mtx for long; a write, a poll, a
+    // cut-off, or an insert waiting for the writes in flight, is waited
+    // for as ever. Once an insert has held the endpoint past the wait,
+    // a call does not wait for it at all.
+    if (inserting &&
+	std::chrono::steady_clock::now() >= insert_give_up(start)) {
+      insert_busy++;
       return false;
     }
-    std::this_thread::sleep_for(
-      std::min<std::chrono::steady_clock::duration>(
-	std::chrono::milliseconds(1), deadline - now));
+    if (l.try_lock_for(QUIET_POLL)) {
+      break;
+    }
   }
+  return true;
 }
 
 int Endpoint::Impl::open_ep(std::string* err)
@@ -1597,7 +1703,12 @@ void Endpoint::deregister_window(uint64_t id)
 int Endpoint::rekey_window(const window_t& w)
 {
   auto& d = *impl;
-  std::lock_guard l(d.mtx);
+  std::unique_lock l(d.mtx, std::defer_lock);
+  if (!d.lock_briefly(l)) {
+    // an insert holds a FI_THREAD_DOMAIN domain, and no other call may
+    // run meanwhile
+    return -EINPROGRESS;
+  }
   if (d.broken) {
     return -EIO;
   }
@@ -1633,15 +1744,18 @@ int Endpoint::rekey_window(const window_t& w)
     }
   }
   // the new region first, while the old one still holds its key, so the
-  // provider cannot hand the old key straight back
+  // provider cannot hand the old key straight back. -EINPROGRESS is
+  // kept for a re-key that an insert put off, so a provider's own comes
+  // back as -EIO.
+  auto failed = [](int r) { return r == -EINPROGRESS ? -EIO : r; };
   Impl::region_t fresh;
   if (int r = d.reg_window_locked(cur.ptr, cur.len, &fresh); r < 0) {
-    return r;
+    return failed(r);
   }
   if (int r = d.close_window_region_locked(cur); r < 0) {
     // the old key still works; keep the window as it was
     fi_close(&fresh.mr->fid);
-    return r;
+    return failed(r);
   }
   cur = fresh;
   d.windows_rekeyed++;
@@ -1653,7 +1767,10 @@ std::string Endpoint::window_token(const window_t& w, uint64_t ofs,
 				   uint64_t len) const
 {
   auto& d = *impl;
-  std::lock_guard l(d.mtx);
+  std::unique_lock l(d.mtx, std::defer_lock);
+  if (!d.lock_briefly(l)) {
+    return {};  // an insert holds the endpoint
+  }
   auto it = d.windows.find(w.id);
   if (d.broken || it == d.windows.end() || !it->second.mr ||
       ofs + len > it->second.len) {
@@ -1710,22 +1827,25 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
 	      " ms); nothing sent");
     return -ETIMEDOUT;
   }
-  const auto budget_end = std::chrono::steady_clock::now() + budget;
+  const auto start = std::chrono::steady_clock::now();
+  const auto budget_end = start + budget;
   const auto deadline = budget_end - margin;
   // the peer's address first, without the endpoint lock: the insert of a
   // new peer can take seconds
   fi_addr_t addr;
-  if (int r = d.get_peer(dst.name, deadline, &addr); r < 0) {
+  if (int r = d.get_peer(dst.name, deadline, start, &addr); r < 0) {
     if (r == -ETIMEDOUT) {
       d.peer_timeouts++;
     }
     return r;
   }
   std::unique_lock l(d.mtx, std::defer_lock);
-  if (!d.lock_for_write(l, deadline)) {
+  if (int r = d.lock_for_write(l, deadline, start); r < 0) {
     d.put_peer(dst.name);
-    d.peer_timeouts++;
-    return -ETIMEDOUT;
+    if (r == -ETIMEDOUT) {
+      d.peer_timeouts++;
+    }
+    return r;
   }
   if (d.broken || !d.ep) {
     d.put_peer(dst.name);
@@ -1946,7 +2066,18 @@ void Endpoint::sync()
 {
   // a provider that places data in software does so inside fi_cq_read,
   // which runs under this lock
-  std::lock_guard l(impl->mtx);
+  auto& d = *impl;
+  std::unique_lock l(d.mtx, std::defer_lock);
+  if (!d.lock_briefly(l)) {
+    // an insert in the provider holds the lock, and nothing polls until
+    // it returns: each poll before it released polls when it was through
+    (void)d.polls.load(std::memory_order_acquire);
+  }
+}
+
+bool Endpoint::quiet() const
+{
+  return impl->quiesce;
 }
 
 Endpoint::stats_t Endpoint::stats() const
@@ -1967,6 +2098,7 @@ Endpoint::stats_t Endpoint::stats() const
     s.peers = d.peers.size();
     s.pending_inserts = d.pending;
   }
+  s.insert_busy = d.insert_busy;
   s.cutoffs_failed = d.cutoffs_failed;
   s.cutoffs_late = d.cutoffs_late;
   s.budget_refused = d.budget_refused;
@@ -2042,14 +2174,31 @@ std::optional<WindowPool::lent_t> WindowPool::acquire(size_t size)
   if (size > slot_size) {
     return std::nullopt;
   }
+  if (rekeys_due && !ep.quiet()) {
+    rekey_put_off();
+  }
   const auto now = std::chrono::steady_clock::now();
   std::lock_guard l(mtx);
+  if (ep.quiet()) {
+    // An insert on a FI_THREAD_DOMAIN domain holds the endpoint, for
+    // seconds perhaps: a window lent now could not get a new key until it
+    // is done, and a provider that places data only while polled would
+    // not fill it meanwhile. The shard replies inline.
+    st.declined_insert++;
+    return std::nullopt;
+  }
   for (size_t i = 0; i < slots.size(); i++) {
     auto& s = slots[i];
-    if (s.in_use || now < s.quarantined_until) {
+    if (s.in_use || s.rekey_due || now < s.quarantined_until) {
       continue;
     }
     std::string token = ep.window_token(s.w, 0, slot_size);
+    if (ep.quiet()) {
+      // an insert began meanwhile, and the token may have been made while
+      // it waited for the writes in flight: no window is lent once one has
+      st.declined_insert++;
+      return std::nullopt;
+    }
     if (token.empty()) {
       return std::nullopt;  // the endpoint lends no more
     }
@@ -2064,14 +2213,64 @@ std::optional<WindowPool::lent_t> WindowPool::acquire(size_t size)
 void WindowPool::release(uint64_t id, std::chrono::milliseconds quarantine,
 			 bool rekey)
 {
-  std::lock_guard l(mtx);
   if (id >= slots.size()) {
     return;
   }
+  // Re-keyed without mtx, which acquire() takes: the re-key calls into
+  // the provider, and waits for the endpoint. The window is still in use
+  // meanwhile, so nothing else touches it.
+  int r = 0;
+  if (rekey) {
+    // put off at once while an insert keeps the endpoint quiet
+    r = ep.quiet() ? -EINPROGRESS : ep.rekey_window(slots[id].w);
+  }
+  std::lock_guard l(mtx);
   auto& s = slots[id];
   s.in_use = false;
+  if (r == -EINPROGRESS) {
+    // an acquire() that finds the endpoint free re-keys it, and
+    // the window is not lent before
+    s.rekey_due = true;
+    s.due_quarantine = quarantine;
+    rekeys_due++;
+    st.rekeys_put_off++;
+    return;
+  }
+  settle_locked(s, quarantine, rekey, r);
+}
+
+void WindowPool::rekey_put_off()
+{
+  // one window a call: the op thread that lends pays for one re-key, as
+  // the one that returned it would have, and those after it for the rest
+  size_t i = 0;
+  {
+    std::lock_guard l(mtx);
+    while (i < slots.size() && !(slots[i].rekey_due && !slots[i].in_use)) {
+      i++;
+    }
+    if (i == slots.size()) {
+      return;
+    }
+    slots[i].in_use = true;  // ours while it is re-keyed, without mtx
+  }
+  const int r = ep.quiet() ? -EINPROGRESS : ep.rekey_window(slots[i].w);
+  std::lock_guard l(mtx);
+  auto& s = slots[i];
+  s.in_use = false;
+  if (r == -EINPROGRESS) {
+    return;  // another insert: still due
+  }
+  s.rekey_due = false;
+  rekeys_due--;
+  settle_locked(s, s.due_quarantine, true, r);
+}
+
+void WindowPool::settle_locked(slot_t& s, std::chrono::milliseconds quarantine,
+			       bool rekey, int r)
+{
   if (rekey) {
-    if (ep.rekey_window(s.w) == 0) {
+    if (r == 0) {
       st.rekeyed++;
       if (quarantine.count() == 0) {
 	// every write of the last operation completed, and a late

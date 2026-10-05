@@ -278,6 +278,19 @@ struct gate_t {
   int total = 0;
 };
 
+/// wait until the endpoint has no insert queued or running
+bool settled(const Endpoint& ep, ms timeout)
+{
+  const auto until = clk::now() + timeout;
+  while (ep.quiet() || ep.stats().pending_inserts) {
+    if (clk::now() >= until) {
+      return false;
+    }
+    std::this_thread::sleep_for(ms(1));
+  }
+  return true;
+}
+
 std::unique_ptr<Endpoint> open_target(const std::string& prov,
 				      const std::string& node,
 				      bool progress = true)
@@ -456,7 +469,8 @@ TEST(OfiPeerInsertDomain, Tcp)
 {
   // FI_THREAD_DOMAIN: an insert stops the endpoint. It must wait for the
   // write in flight to be cut off at its budget, and writes that start
-  // while it runs must give up at their budgets, not when it ends.
+  // while it runs, to its own peer or another, must give up after
+  // insert_wait, not when it ends.
   auto gate = std::make_shared<gate_t>();
   window_owner_t a, b, s;
   a.ep = open_target("tcp", "127.0.0.1");
@@ -500,10 +514,24 @@ TEST(OfiPeerInsertDomain, Tcp)
   });
   std::this_thread::sleep_for(ms(100));
 
-  // first contact with A while it is in flight
+  // first contact with A while it is in flight: the insert waits for it,
+  // and the write to A gives up on the insert after insert_wait, having
+  // sent nothing, instead of waiting for it within its budget
   std::atomic<int> ra{1};
-  std::thread ta([&] { ra = writer->write(a.tok, &zv, 1, one, ms(20000)); });
+  std::atomic<bool> pa{true};
+  clk::duration a_took{};
+  std::thread ta([&] {
+    bool posted = true;
+    const auto t = clk::now();
+    ra = writer->write(a.tok, &zv, 1, one, ms(20000), &posted);
+    a_took = clk::now() - t;
+    pa = posted;
+  });
   ASSERT_TRUE(gate->wait_held(ms(5000)));
+  ta.join();
+  EXPECT_EQ(-EBUSY, ra.load());
+  EXPECT_FALSE(pa.load());
+  EXPECT_LT(a_took, ms(250));
   tsw.join();
   EXPECT_EQ(-ETIMEDOUT, rs.load());
   // cut off within its budget: the insert did not delay it
@@ -515,20 +543,245 @@ TEST(OfiPeerInsertDomain, Tcp)
     EXPECT_GE(gate->held_at - s_start, ms(700));
   }
 
-  // while the insert holds the endpoint, a write to B gives up at its
-  // budget instead of waiting for the insert
+  // while the insert holds the endpoint, a write to B gives up after
+  // insert_wait, having sent nothing, instead of waiting for the insert
+  // or for its budget
   const auto t0 = clk::now();
-  EXPECT_EQ(-ETIMEDOUT, writer->write(b.tok, &zv, 1, one, ms(400)));
-  EXPECT_LT(clk::now() - t0, ms(1000));
-  EXPECT_GE(writer->stats().peer_timeouts, 1u);
+  bool posted = true;
+  EXPECT_EQ(-EBUSY, writer->write(b.tok, &zv, 1, one, ms(2000), &posted));
+  EXPECT_LT(clk::now() - t0, ms(250));
+  EXPECT_FALSE(posted);
+  EXPECT_EQ(2u, writer->stats().insert_busy);  // A's and B's
+  EXPECT_EQ(0u, writer->stats().peer_timeouts);
 
+  // the insert goes on, and A takes writes once it is done
   gate->release();
-  ta.join();
-  EXPECT_EQ(0, ra.load()) << writer->last_error();
+  ASSERT_TRUE(settled(*writer, ms(5000)));
+  EXPECT_EQ(0, writer->write(a.tok, &zv, 1, one, BUDGET)) << writer->last_error();
   EXPECT_EQ(0, writer->write(b.tok, &iov, 1, all, BUDGET)) << writer->last_error();
   b.ep->sync();
   EXPECT_EQ(0, memcmp(b.mem.data(), src.data(), N));
   EXPECT_EQ(1, gate->count(a.tok.name));
+}
+
+TEST(OfiPeerInsertDomain, OpThreadsDoNotWait)
+{
+  // FI_THREAD_DOMAIN, on an endpoint that writes and lends gather windows,
+  // as an OSD's does. While an insert holds it, as a slow provider's does
+  // for seconds, an op thread that lends or returns a window, reads one,
+  // or writes to the new peer or a known one must not wait for the
+  // insert longer than insert_wait, counted from when the endpoint went
+  // quiet: once the insert has held it that long, each call goes on
+  // without the endpoint at once. Once the insert is done, the endpoint
+  // and the pool are whole again, each acquire re-keying one window
+  // whose re-key the insert put off.
+  auto gate = std::make_shared<gate_t>();
+  window_owner_t a, b;
+  a.ep = open_target("tcp", "127.0.0.1");
+  b.ep = open_target("tcp", "127.0.0.1");
+  const size_t W = 64 << 10;
+  // three gather windows, and a window outside the pool; the memory
+  // first, so that it outlives the endpoint lending it
+  std::vector<char> mem(4 * W, 0);
+  config_t c;
+  c.provider = "tcp";
+  c.node = "127.0.0.1";
+  c.thread_safe = false;
+  c.stage_size = W;
+  c.stage_count = 2;
+  c.progress_thread = true;
+  c.insert_wait = ms(300);
+  c.insert_hook = [gate](const std::string& name) { gate->enter(name); };
+  std::string err;
+  auto osd = Endpoint::open(c, &err);
+  if (!a.ep || !b.ep || !osd) {
+    GTEST_SKIP() << "tcp is not available: " << err;
+  }
+  ASSERT_NE(osd->describe().find("peer inserts pause writes"),
+	    std::string::npos) << osd->describe();
+  ASSERT_TRUE(lend(a, W));
+  ASSERT_TRUE(lend(b, W));
+  auto pool = WindowPool::create(*osd, mem.data(), W, 3, &err);
+  ASSERT_TRUE(pool) << err;
+  Endpoint::window_t w;
+  ASSERT_EQ(0, osd->register_window(mem.data() + 3 * W, W, &w));
+  std::vector<char> src(W, 'q');
+  iovec iov{src.data(), W};
+  std::vector<Endpoint::write_t> all = {{0, W, 0}};
+
+  // B known; two gathers in flight, their windows lent before the insert
+  ASSERT_EQ(0, osd->write(b.tok, &iov, 1, all, BUDGET)) << osd->last_error();
+  auto lent = pool->acquire(W);
+  auto lent2 = pool->acquire(W);
+  ASSERT_TRUE(lent && lent2);
+  const auto k1 = parse_token(lent->token)->key;
+  const auto k2 = parse_token(lent2->token)->key;
+
+  // first contact with A: its insert holds the endpoint until released.
+  // Should a call below wait for it after all, the insert is let go in
+  // the end, and the test fails instead of hanging.
+  gate->hold = a.tok.name;
+  std::thread backstop([gate] {
+    {
+      std::unique_lock l(gate->m);
+      gate->cv.wait_for(l, ms(5000), [&] { return gate->open; });
+    }
+    gate->release();
+  });
+  // the write to A waits for its own insert no longer than insert_wait,
+  // and sends nothing
+  bool posted = true;
+  auto t0 = clk::now();
+  EXPECT_EQ(-EBUSY, osd->write(a.tok, &iov, 1, all, ms(20000), &posted));
+  EXPECT_LT(clk::now() - t0, c.insert_wait + ms(250));
+  EXPECT_FALSE(posted);
+  EXPECT_TRUE(gate->wait_held(ms(5000)));
+  EXPECT_TRUE(osd->quiet());
+  {
+    // the endpoint has been quiet for insert_wait at least
+    std::unique_lock l(gate->m);
+    const auto held_at = gate->held_at;
+    l.unlock();
+    std::this_thread::sleep_until(held_at + c.insert_wait);
+  }
+
+  // what an op thread does meanwhile; none of it waits for the insert,
+  // nor pays insert_wait again
+  const auto brief = c.insert_wait / 2;
+  t0 = clk::now();
+  // no window, though one is free: the shard replies inline
+  EXPECT_FALSE(pool->acquire(W));
+  EXPECT_LT(clk::now() - t0, brief);
+  for (auto* l : {&lent, &lent2}) {
+    t0 = clk::now();
+    pool->release((*l)->id, ms(0), true);  // its re-key put off
+    EXPECT_LT(clk::now() - t0, brief);
+  }
+  t0 = clk::now();
+  osd->sync();
+  EXPECT_LT(clk::now() - t0, brief);
+  t0 = clk::now();
+  EXPECT_TRUE(osd->window_token(w, 0, W).empty());
+  EXPECT_LT(clk::now() - t0, brief);
+  t0 = clk::now();
+  EXPECT_EQ(-EINPROGRESS, osd->rekey_window(w));
+  EXPECT_LT(clk::now() - t0, brief);
+  for (auto* peer : {&b.tok, &a.tok}) {
+    t0 = clk::now();
+    posted = true;
+    EXPECT_EQ(-EBUSY, osd->write(*peer, &iov, 1, all, BUDGET, &posted));
+    EXPECT_LT(clk::now() - t0, brief);
+    EXPECT_FALSE(posted);
+  }
+  auto ps = pool->stats();
+  EXPECT_EQ(1u, ps.declined_insert);
+  EXPECT_EQ(2u, ps.rekeys_put_off);
+  EXPECT_EQ(0u, ps.rekeyed);
+  // A's writes, the sync, the token, the re-key and B's write; the pool
+  // did not call into the endpoint
+  EXPECT_EQ(6u, osd->stats().insert_busy);
+  EXPECT_EQ(0u, osd->stats().peer_timeouts);
+
+  gate->release();
+  backstop.join();
+  ASSERT_TRUE(settled(*osd, ms(5000)));
+
+  // each acquire does one re-key that was put off, and a window is lent
+  // only once it has its new key
+  auto again = pool->acquire(W);
+  ASSERT_TRUE(again);
+  EXPECT_EQ(lent->id, again->id);
+  EXPECT_NE(k1, parse_token(again->token)->key);
+  ps = pool->stats();
+  EXPECT_EQ(1u, ps.rekeyed);
+  EXPECT_EQ(0u, ps.rekey_failed);
+  EXPECT_EQ(3u, ps.acquired);
+  auto again2 = pool->acquire(W);
+  ASSERT_TRUE(again2);
+  EXPECT_EQ(lent2->id, again2->id);
+  EXPECT_NE(k2, parse_token(again2->token)->key);
+  ps = pool->stats();
+  EXPECT_EQ(2u, ps.rekeyed);
+  EXPECT_EQ(4u, ps.acquired);
+  pool->release(again->id, ms(0), true);
+  pool->release(again2->id, ms(0), true);
+  EXPECT_EQ(4u, pool->stats().rekeyed);
+
+  // and the rest works again, A included
+  EXPECT_FALSE(osd->window_token(w, 0, W).empty());
+  EXPECT_EQ(0, osd->rekey_window(w)) << osd->last_error();
+  EXPECT_EQ(0, osd->write(a.tok, &iov, 1, all, BUDGET)) << osd->last_error();
+  EXPECT_EQ(0, osd->write(b.tok, &iov, 1, all, BUDGET)) << osd->last_error();
+  a.ep->sync();
+  b.ep->sync();
+  EXPECT_EQ(0, memcmp(a.mem.data(), src.data(), W));
+  EXPECT_EQ(0, memcmp(b.mem.data(), src.data(), W));
+  EXPECT_EQ(6u, osd->stats().insert_busy);
+  EXPECT_EQ(1, gate->count(a.tok.name));
+}
+
+TEST(OfiPeerInsertDomain, FirstContactsDoNotQueue)
+{
+  // FI_THREAD_DOMAIN: the inserts run one at a time. A first write to a
+  // peer waits for an insert no longer than insert_wait: not for its own
+  // peer's, and not for another's queued ahead of it, whose turn comes
+  // first. The inserts go on, and later writes find both peers ready.
+  auto gate = std::make_shared<gate_t>();
+  window_owner_t a, b;
+  a.ep = open_target("tcp", "127.0.0.1");
+  b.ep = open_target("tcp", "127.0.0.1");
+  auto writer = open_writer("tcp", "127.0.0.1", false, 1 << 20, 4, gate);
+  if (!a.ep || !b.ep || !writer) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  const size_t N = 1 << 20;
+  ASSERT_TRUE(lend(a, N));
+  ASSERT_TRUE(lend(b, N));
+  std::vector<char> src(N, 'f');
+  iovec iov{src.data(), N};
+  std::vector<Endpoint::write_t> all = {{0, N, 0}};
+  gate->hold = a.tok.name;
+  std::thread backstop([gate] {
+    {
+      std::unique_lock l(gate->m);
+      gate->cv.wait_for(l, ms(5000), [&] { return gate->open; });
+    }
+    gate->release();
+  });
+
+  // A's insert starts, and is held
+  bool posted = true;
+  auto t0 = clk::now();
+  EXPECT_EQ(-EBUSY, writer->write(a.tok, &iov, 1, all, ms(20000), &posted));
+  EXPECT_LT(clk::now() - t0, ms(250));
+  EXPECT_FALSE(posted);
+  EXPECT_TRUE(gate->wait_held(ms(5000)));
+
+  // B's insert is queued behind it
+  posted = true;
+  t0 = clk::now();
+  EXPECT_EQ(-EBUSY, writer->write(b.tok, &iov, 1, all, ms(20000), &posted));
+  EXPECT_LT(clk::now() - t0, ms(250));
+  EXPECT_FALSE(posted);
+  EXPECT_EQ(0, gate->count(b.tok.name));
+  auto st = writer->stats();
+  EXPECT_EQ(2u, st.insert_busy);
+  EXPECT_EQ(0u, st.peer_timeouts);
+  EXPECT_EQ(2u, st.pending_inserts);
+
+  gate->release();
+  backstop.join();
+  ASSERT_TRUE(settled(*writer, ms(5000)));
+  EXPECT_EQ(0, writer->write(a.tok, &iov, 1, all, BUDGET)) << writer->last_error();
+  EXPECT_EQ(0, writer->write(b.tok, &iov, 1, all, BUDGET)) << writer->last_error();
+  a.ep->sync();
+  b.ep->sync();
+  EXPECT_EQ(0, memcmp(a.mem.data(), src.data(), N));
+  EXPECT_EQ(0, memcmp(b.mem.data(), src.data(), N));
+  EXPECT_EQ(1, gate->count(a.tok.name));
+  EXPECT_EQ(1, gate->count(b.tok.name));
+  EXPECT_EQ(2u, writer->stats().peers_inserted);
+  EXPECT_EQ(2u, writer->stats().insert_busy);
 }
 
 namespace {

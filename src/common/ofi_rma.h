@@ -129,6 +129,16 @@ struct config_t {
   /// threads adding peers, on a thread-safe domain; a FI_THREAD_DOMAIN
   /// domain has one, since an insert there stops every other call
   unsigned insert_threads = 4;
+  /// On a FI_THREAD_DOMAIN domain an insert holds the endpoint for as
+  /// long as the provider takes, which can be seconds (see write()).
+  /// Calls that need the endpoint meanwhile, or the peer being added,
+  /// wait for it at most this long and then go on without it, so that
+  /// the thread making them, an OSD op thread say, is not held up: see
+  /// write(), window_token(), rekey_window() and sync(). The wait counts
+  /// from the call, or from when the endpoint went quiet, whichever came
+  /// first: once an insert has held the endpoint this long, calls give
+  /// up on it at once. An insert quicker than this refuses nothing.
+  std::chrono::milliseconds insert_wait{10};
   /// for tests: runs on the insert thread just before each
   /// fi_av_insert(), with the peer's name, under the same locks
   std::function<void(const std::string&)> insert_hook;
@@ -197,9 +207,16 @@ public:
    * when no write of the window's current operation is still expected.
    * Returns 0, or a negative errno with the window and its key unchanged;
    * do not reuse the memory then until key_quarantine has passed.
+   * -EINPROGRESS is the exception: an insert on a FI_THREAD_DOMAIN domain
+   * held the endpoint, in the provider, past config_t::insert_wait, and a
+   * later call that succeeds, once quiet() is false, makes the memory
+   * reusable. No other failure returns it.
    */
   int rekey_window(const window_t& w);
-  /// the token naming [ofs, ofs+len) of a registered window
+  /// the token naming [ofs, ofs+len) of a registered window; empty for a
+  /// window it does not know, when the endpoint takes no more writes, and
+  /// when an insert on a FI_THREAD_DOMAIN domain held the endpoint, in the
+  /// provider, past config_t::insert_wait
   std::string window_token(const window_t& w, uint64_t ofs, uint64_t len) const;
 
   struct write_t {
@@ -212,9 +229,10 @@ public:
    * window dst names. Blocks until every write completed, or until the
    * budget runs out. Returns 0 or a negative errno: -EPROTONOSUPPORT
    * for another provider's token, -EBUSY when no staging buffer is
-   * free, -E2BIG when the source does not fit one, -ETIMEDOUT when the
-   * budget ran out, -ECANCELED when another write's cut-off took this
-   * one's writes with it, -EIO when the endpoint takes no more writes.
+   * free or an insert keeps the endpoint (see below), -E2BIG when the
+   * source does not fit one, -ETIMEDOUT when the budget ran out,
+   * -ECANCELED when another write's cut-off took this one's writes with
+   * it, -EIO when the endpoint takes no more writes.
    * After a failure the window may hold some of the bytes.
    *
    * *posted, when given, says whether any write was handed to the
@@ -266,19 +284,26 @@ public:
    * the peer's next hop to resolve, for up to a second, and older
    * versions pinged it, for up to 10 seconds. A thread of the endpoint's
    * own does the
-   * insert, and writes to the same peer wait for it, each only until
-   * its own budget runs out (-ETIMEDOUT, with nothing sent). The insert
-   * goes on, so a later write finds the peer ready. On a thread-safe
-   * domain, writes to other peers go on meanwhile. A provider that
-   * offers only FI_THREAD_DOMAIN allows no other call during the
-   * insert: the insert waits until the writes in flight are done, so
-   * none of them misses its cut-off, and writes that start meanwhile
-   * wait for it, again only within their budgets. So do progress(),
-   * sync(), window_token() and the window calls, and with them a
-   * progress thread that places incoming data. A first write to a new
-   * peer returns -EBUSY at once, having sent nothing, when
-   * max_pending_inserts are already under way, or when max_peers are
-   * known and all of them are in use.
+   * insert, and writes to the same peer wait for it. On a thread-safe
+   * domain each waits only until its own budget runs out (-ETIMEDOUT,
+   * with nothing sent), and writes to other peers go on meanwhile. The
+   * insert goes on, so a later write finds the peer ready. A provider
+   * that offers only FI_THREAD_DOMAIN allows no other call during the
+   * insert, and has the inserts run one at a time: the insert waits
+   * until the writes in flight are done, so none of them misses its
+   * cut-off, and then holds the endpoint until the provider returns. A
+   * write that starts meanwhile, to any peer, and a write whose new
+   * peer is not ready, its own insert running or queued behind others,
+   * wait for an insert at most config_t::insert_wait, not for their
+   * budgets, since their caller, an OSD op thread say, has other work
+   * queued behind it, and then return -EBUSY, having sent nothing.
+   * window_token(), rekey_window() and sync() wait as long for an
+   * insert in the provider and go on without the endpoint (see each);
+   * quiet() says when an insert keeps it quiet. progress(), the window
+   * registrations, and a progress thread that places incoming data,
+   * wait for the insert. A first write to a new peer returns -EBUSY at
+   * once, having sent nothing, when max_pending_inserts are already
+   * under way, or when max_peers are known and all of them are in use.
    */
   int write(const token_t& dst, const struct iovec* iov, size_t iovcnt,
 	    const std::vector<write_t>& writes,
@@ -287,8 +312,14 @@ public:
   /// one pass over the completion queue
   void progress();
   /// order the caller's reads of window memory after writes this
-  /// endpoint placed while being polled
+  /// endpoint placed while being polled. Nothing polls it while an insert
+  /// on a FI_THREAD_DOMAIN domain is in the provider: after
+  /// config_t::insert_wait, the reads are ordered after the last poll
+  /// before the insert.
   void sync();
+  /// an insert on a FI_THREAD_DOMAIN domain keeps the endpoint quiet: it
+  /// waits for the writes in flight, or runs, and no write starts
+  bool quiet() const;
 
   struct stats_t {
     uint64_t writes_posted = 0;
@@ -300,12 +331,21 @@ public:
     uint64_t resets = 0;  ///< cut-offs: endpoint closed and reopened
     /// writes that gave up before sending anything: their peer's
     /// address insert, or the endpoint, did not get ready in the budget
+    /// (on a FI_THREAD_DOMAIN domain, waits for an insert count as
+    /// insert_busy instead)
     uint64_t peer_timeouts = 0;
     /// first writes to a new peer refused for max_pending_inserts or
     /// max_peers, with nothing sent; the peers known and being added
     uint64_t inserts_refused = 0;
     uint64_t peers = 0;
     uint64_t pending_inserts = 0;
+    /// calls that gave up on an insert on a FI_THREAD_DOMAIN domain,
+    /// having waited for it at most insert_wait: writes refused with
+    /// nothing sent, to a known peer or to one not yet ready, syncs done
+    /// without the lock, and calls of window_token() and rekey_window()
+    /// that gave up. A WindowPool makes those only when an insert begins
+    /// during the call; it counts what it did not do (see its stats).
+    uint64_t insert_busy = 0;
     /// cut-offs whose close failed, and cut-offs that ended after a
     /// budget they protected
     uint64_t cutoffs_failed = 0;
@@ -380,6 +420,11 @@ private:
  * missed its operation, and not a provider's late duplicate of one that
  * completed. A window released with a quarantine, or that could not get
  * a new key, stays out of use that long.
+ *
+ * Neither lending nor returning a window waits for an insert on a
+ * FI_THREAD_DOMAIN domain: no window is lent while one keeps the
+ * endpoint quiet, and a window returned meanwhile gets its new key from
+ * an acquire() after it.
  */
 class WindowPool {
 public:
@@ -396,7 +441,8 @@ public:
     size_t size = 0;
     std::string token;  ///< for the whole window
   };
-  /// a free window of at least size bytes, or nullopt
+  /// a free window of at least size bytes, or nullopt; nullopt also while
+  /// an insert on a FI_THREAD_DOMAIN domain keeps the endpoint quiet
   std::optional<lent_t> acquire(size_t size);
   /**
    * Return a window. rekey gives it a new key first. A window released
@@ -409,6 +455,11 @@ public:
    * drops what carries the old one, so the window stays out of use for
    * the quarantine anyway, and for the endpoint's key_quarantine at least
    * when it was re-keyed or the new key failed.
+   *
+   * A re-key that an insert on a FI_THREAD_DOMAIN domain keeps from the
+   * endpoint is put off: an acquire() that finds the endpoint free does
+   * it, one window a call, and the window is not lent before. Its
+   * quarantine then counts from the re-key.
    */
   void release(uint64_t id, std::chrono::milliseconds quarantine, bool rekey);
 
@@ -420,6 +471,11 @@ public:
     /// that did not complete
     uint64_t rekeyed_quarantined = 0;
     uint64_t rekey_failed = 0;
+    /// acquires that lent nothing while an insert on a FI_THREAD_DOMAIN
+    /// domain kept the endpoint quiet, one per window asked for, and
+    /// re-keys such an insert put off
+    uint64_t declined_insert = 0;
+    uint64_t rekeys_put_off = 0;
   };
   stats_t stats() const;
   size_t count() const { return slots.size(); }
@@ -431,11 +487,22 @@ private:
     Endpoint::window_t w;
     bool in_use = false;
     std::chrono::steady_clock::time_point quarantined_until{};
+    /// released while an insert held the endpoint: not lent until
+    /// re-keyed, and then quarantined this long
+    bool rekey_due = false;
+    std::chrono::milliseconds due_quarantine{0};
   };
+  /// re-key a window whose re-key an insert put off; without mtx
+  void rekey_put_off();
+  /// a window back from use, re-keyed with result r when rekey
+  void settle_locked(slot_t& s, std::chrono::milliseconds quarantine,
+		     bool rekey, int r);
   Endpoint& ep;
   const size_t slot_size;
   mutable std::mutex mtx;
   std::vector<slot_t> slots;
+  /// slots with rekey_due; written under mtx, read without it
+  std::atomic<size_t> rekeys_due{0};
   stats_t st;
 };
 
