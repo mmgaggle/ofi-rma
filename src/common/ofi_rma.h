@@ -89,12 +89,13 @@ struct config_t {
   std::chrono::milliseconds cutoff_cost_max{2000};
   /// A cut-off that ends after the budget it protects, by no more than
   /// this, and that itself took no longer, is counted (cutoffs_late) and
-  /// the endpoint goes on; one beyond it makes the endpoint unsafe. A cut-
-  /// off is usually late because the thread that should start it was not
-  /// running: a loaded host, a scheduling delay. Those who wait for an
-  /// OSD's reply are not affected, since the reply follows the cut-off;
-  /// a client that gave a request up must allow this much beyond the
-  /// pool's lease and drain.
+  /// the endpoint goes on. One whose close or cancel itself took longer
+  /// makes the endpoint unsafe; for a quick one that ended later, see
+  /// late_fail_closed. A cut-off is usually late because the thread that
+  /// should start it was not running: a loaded host, a scheduling delay.
+  /// Those who wait for an OSD's reply are not affected, since the reply
+  /// follows the cut-off; a client that gave a request up must allow this
+  /// much beyond the pool's lease and drain.
   std::chrono::milliseconds late_tolerance{1000};
   /// A cut-off that took no longer than late_tolerance but ended later
   /// than it, because the thread that should have started it did not run
@@ -221,9 +222,10 @@ public:
    * whatever it returns.
    *
    * -ENOTRECOVERABLE means a cut-off went wrong: closing the endpoint
-   * failed, so its writes were not cut off, or the cut-off ended after
-   * this write's budget. Bytes may land in the window after the caller
-   * gave up. The endpoint is then unsafe() and takes no more writes.
+   * failed, so its writes were not cut off, or a cut-off that made the
+   * endpoint unsafe (see below) ended after this write's budget. Bytes
+   * may land in the window after the caller gave up. The endpoint is
+   * then unsafe() and takes no more writes.
    *
    * The budget bounds when the writes may still land. A write that is
    * still in flight when it runs out is cut off. When the provider
@@ -358,8 +360,8 @@ public:
   stats_t stats() const;
   /// the provider's text for the most recent failed completion
   std::string last_error() const;
-  /// a cut-off failed or ended late (see write()); the endpoint takes no
-  /// more writes, and writes it took may still land
+  /// a cut-off failed (see write()); the endpoint takes no more writes,
+  /// and writes it took may still land
   bool unsafe() const;
   /// config_t::key_quarantine
   std::chrono::milliseconds key_quarantine() const;
