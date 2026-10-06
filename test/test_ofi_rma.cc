@@ -163,6 +163,49 @@ TEST_P(OfiWrite, PlacesRanges)
   EXPECT_EQ(s.bytes_written, N + N / 3);
 }
 
+TEST(OfiHmem, AskingForItStillOpensAProviderWithout)
+{
+  // a provider that offers no FI_HMEM is still used, with host windows;
+  // and asking for it leaves the region addressing as a writer that did
+  // not ask sees it, since the token's base depends on it
+  int tried = 0;
+  for (const char* prov : {"tcp", "shm"}) {
+    config_t c;
+    c.provider = prov;
+    c.progress_thread = true;
+    config_t hc = c;
+    hc.hmem = true;
+    std::string err;
+    auto plain = Endpoint::open(c, &err);
+    auto ep = Endpoint::open(hc, &err);
+    if (!plain || !ep) {
+      continue;
+    }
+    tried++;
+    auto virt = [](const Endpoint& e) {
+      return e.describe().find("virtual-address regions") != std::string::npos;
+    };
+    EXPECT_EQ(virt(*plain), virt(*ep)) << prov;
+    EXPECT_EQ(plain->provider(), ep->provider()) << prov;
+    EXPECT_FALSE(plain->hmem()) << prov;
+    std::vector<char> host(4096);
+    Endpoint::window_t w;
+    EXPECT_EQ(0, ep->register_window(host.data(), host.size(), &w)) << prov;
+    const bool says = ep->describe().find("device-memory") != std::string::npos;
+    EXPECT_EQ(ep->hmem(), says) << prov;
+    if (!ep->hmem()) {
+      // nothing is touched: the registration is refused up front
+      EXPECT_EQ(-EOPNOTSUPP,
+                ep->register_window(host.data(), host.size(),
+                                    memory_t{memory_t::iface_t::rocr, 0}, &w))
+        << prov;
+    }
+  }
+  if (!tried) {
+    GTEST_SKIP() << "neither tcp nor shm is available";
+  }
+}
+
 TEST(OfiWriteCutOff, Tcp)
 {
   // a window owner that never polls: over tcp, a write into it cannot

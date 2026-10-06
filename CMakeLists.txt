@@ -13,6 +13,8 @@ option(OFI_RMA_SHARED "Build a shared library" ${OFI_RMA_TOP_LEVEL})
 option(OFI_RMA_BUILD_TESTS "Build the tests" ${OFI_RMA_TOP_LEVEL})
 option(OFI_RMA_INSTALL "Install the library, header and package files"
   ${OFI_RMA_TOP_LEVEL})
+set(OFI_RMA_HIP "AUTO" CACHE STRING
+  "Test windows in AMD GPU memory with HIP: ON, OFF or AUTO")
 
 include(GNUInstallDirs)
 find_package(Threads REQUIRED)
@@ -63,6 +65,23 @@ if(OFI_RMA_BUILD_TESTS)
   target_link_libraries(unittest_ofi_rma ofi_rma GTest::gtest_main)
   add_test(NAME unittest_ofi_rma COMMAND unittest_ofi_rma)
 
+  if(NOT OFI_RMA_HIP STREQUAL "OFF")
+    find_path(HIP_RUNTIME_INCLUDE_DIR hip/hip_runtime_api.h
+      HINTS /opt/rocm/include)
+    find_library(HIP_RUNTIME_LIBRARY amdhip64 HINTS /opt/rocm/lib)
+    if(HIP_RUNTIME_INCLUDE_DIR AND HIP_RUNTIME_LIBRARY)
+      add_executable(unittest_ofi_rma_hip test/test_ofi_rma_hip.cc)
+      target_compile_definitions(unittest_ofi_rma_hip PRIVATE
+        __HIP_PLATFORM_AMD__)
+      target_include_directories(unittest_ofi_rma_hip PRIVATE
+        ${HIP_RUNTIME_INCLUDE_DIR})
+      target_link_libraries(unittest_ofi_rma_hip ofi_rma
+        ${HIP_RUNTIME_LIBRARY} GTest::gtest_main)
+      add_test(NAME unittest_ofi_rma_hip COMMAND unittest_ofi_rma_hip)
+    elseif(OFI_RMA_HIP STREQUAL "ON")
+      message(FATAL_ERROR "OFI_RMA_HIP=ON, but the HIP runtime is missing")
+    endif()
+  endif()
 endif()
 
 if(OFI_RMA_INSTALL)

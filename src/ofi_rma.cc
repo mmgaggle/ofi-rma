@@ -217,6 +217,8 @@ struct Endpoint::Impl {
   std::string my_name;
   uint64_t mr_mode = 0;
   bool dc = false;
+  /// the provider offers FI_HMEM
+  bool hmem = false;
   /// the domain is FI_THREAD_SAFE: an address insert needs no lock
   bool thread_safe = false;
   uint64_t max_write = MAX_WRITE;
@@ -251,6 +253,7 @@ struct Endpoint::Impl {
     size_t len = 0;
     uint64_t key = 0;
     void* desc = nullptr;
+    memory_t mem;
   };
   std::map<uint64_t, region_t> windows;
   std::atomic<uint64_t> nwindows{0};  ///< windows.size(), readable without mtx
@@ -268,7 +271,8 @@ struct Endpoint::Impl {
   /// once it says it cannot, it is not asked again
   std::atomic<int> rekey_in_place{-1};
   /// register a window's memory, under a key out of quarantine
-  int reg_window_locked(char* ptr, size_t len, region_t* out);
+  int reg_window_locked(char* ptr, size_t len, const memory_t& mem,
+                        region_t* out);
   /// close a window's region, and put its key in quarantine
   int close_window_region_locked(region_t& r);
 
@@ -478,7 +482,8 @@ struct Endpoint::Impl {
   int cancel_plan_locked(plan_t* p, bool* simulated);
   /// register memory; a region others write into needs a key, a local
   /// write source only a descriptor
-  int reg(char* ptr, size_t len, uint64_t access, region_t* out);
+  int reg(char* ptr, size_t len, uint64_t access, region_t* out,
+          const memory_t& mem = {});
   /// one pass over the completion queue; returns the completions read
   size_t poll_locked();
   void complete_locked(op_t* op, int err);
@@ -561,13 +566,57 @@ Endpoint::Impl::~Impl()
   if (info) fi_freeinfo(info);
 }
 
-int Endpoint::Impl::reg(char* ptr, size_t len, uint64_t access, region_t* out)
+int Endpoint::Impl::reg(char* ptr, size_t len, uint64_t access, region_t* out,
+                        const memory_t& mem)
 {
+  const bool device = mem.iface != memory_t::iface_t::system;
+  if (device && !hmem) {
+    set_err(prov + " does not offer FI_HMEM, so a window cannot live in "
+            "device memory");
+    return -EOPNOTSUPP;
+  }
+  if (cfg.reg_hook) {
+    cfg.reg_hook(ptr, len, mem);
+  }
   const uint64_t req_key = (mr_mode & FI_MR_PROV_KEY) ? 0 : next_key++;
   fid_mr* mr = nullptr;
-  int r = fi_mr_reg(domain, ptr, len, access, 0, req_key, 0, &mr, nullptr);
+  int r;
+  if (!device) {
+    r = fi_mr_reg(domain, ptr, len, access, 0, req_key, 0, &mr, nullptr);
+  } else {
+    iovec iov{ptr, len};
+    fi_mr_attr attr{};
+    attr.mr_iov = &iov;
+    attr.iov_count = 1;
+    attr.access = access;
+    attr.requested_key = req_key;
+    switch (mem.iface) {
+    case memory_t::iface_t::cuda:
+      attr.iface = FI_HMEM_CUDA;
+      attr.device.cuda = mem.device;
+      break;
+    case memory_t::iface_t::ze:
+      attr.iface = FI_HMEM_ZE;
+      attr.device.ze = mem.device;
+      break;
+    default:
+      // ROCr finds the device from the address; the union stays zero,
+      // as older libfabric headers have no member for it
+      attr.iface = FI_HMEM_ROCR;
+      break;
+    }
+    r = fi_mr_regattr(domain, &attr, 0, &mr);
+  }
   if (r) {
-    set_err("fi_mr_reg: " + fi_err(r));
+    std::string e = std::string(device ? "fi_mr_regattr" : "fi_mr_reg") +
+      ": " + fi_err(r);
+    if (device && r == -FI_ENOSYS) {
+      // a provider can offer FI_HMEM while libfabric itself was built
+      // without the runtime for this kind of device memory
+      e += " (this libfabric has no support for the device memory: "
+        "see FI_LOG_LEVEL=info for the hmem interfaces it initialized)";
+    }
+    set_err(e);
     return to_errno(r);
   }
   if (mr_mode & FI_MR_ENDPOINT) {
@@ -587,11 +636,12 @@ int Endpoint::Impl::reg(char* ptr, size_t len, uint64_t access, region_t* out)
     fi_close(&mr->fid);
     return -EOPNOTSUPP;
   }
-  *out = region_t{mr, ptr, len, key, fi_mr_desc(mr)};
+  *out = region_t{mr, ptr, len, key, fi_mr_desc(mr), mem};
   return 0;
 }
 
-int Endpoint::Impl::reg_window_locked(char* ptr, size_t len, region_t* out)
+int Endpoint::Impl::reg_window_locked(char* ptr, size_t len,
+                                      const memory_t& mem, region_t* out)
 {
   const auto now = std::chrono::steady_clock::now();
   while (!retired_order.empty() && retired_order.front().first <= now) {
@@ -603,7 +653,7 @@ int Endpoint::Impl::reg_window_locked(char* ptr, size_t len, region_t* out)
   }
   for (int attempt = 0; attempt < REKEY_ATTEMPTS; attempt++) {
     region_t fresh;
-    if (int r = reg(ptr, len, FI_REMOTE_WRITE, &fresh); r < 0) {
+    if (int r = reg(ptr, len, FI_REMOTE_WRITE, &fresh, mem); r < 0) {
       return r;
     }
     if (!retired.count(fresh.key)) {
@@ -1334,7 +1384,7 @@ void Endpoint::Impl::reset_locked()
   if (rebind) {
     for (auto& [id, w] : windows) {
       region_t fresh;
-      if (reg_window_locked(w.ptr, w.len, &fresh) < 0) {
+      if (reg_window_locked(w.ptr, w.len, w.mem, &fresh) < 0) {
         broken = true;
         return;
       }
@@ -1542,20 +1592,37 @@ std::unique_ptr<Endpoint> Endpoint::open(const config_t& cfg, std::string* err)
   // delivery_complete(). Ask for a thread-safe domain too, so that a slow
   // address insert holds up no other write; that matters less, so a
   // provider without one is preferred to giving up delivery-complete.
+  //
+  // Device memory, when asked for, matters more than either: an owner
+  // that asks for it lends windows on a GPU, and would otherwise have to
+  // stage every transfer through host memory. Without it, the windows are
+  // in host memory only (see hmem()).
   int r = -FI_ENODATA;
-  for (uint64_t op_flags : {uint64_t{FI_DELIVERY_COMPLETE}, uint64_t{0}}) {
-    for (fi_threading threading : {FI_THREAD_SAFE, FI_THREAD_DOMAIN}) {
-      if (threading == FI_THREAD_SAFE && !cfg.thread_safe) {
-	continue;
+  for (bool hmem : {cfg.hmem, false}) {
+    if (hmem) {
+      hints->caps |= FI_HMEM;
+      hints->domain_attr->mr_mode |= FI_MR_HMEM;
+    } else {
+      hints->caps &= ~FI_HMEM;
+      hints->domain_attr->mr_mode &= ~FI_MR_HMEM;
+    }
+    for (uint64_t op_flags : {uint64_t{FI_DELIVERY_COMPLETE}, uint64_t{0}}) {
+      for (fi_threading threading : {FI_THREAD_SAFE, FI_THREAD_DOMAIN}) {
+	if (threading == FI_THREAD_SAFE && !cfg.thread_safe) {
+	  continue;
+	}
+	hints->tx_attr->op_flags = op_flags;
+	hints->domain_attr->threading = threading;
+	r = fi_getinfo(API_VERSION, node, service, flags, hints, &d->info);
+	if (r != -FI_ENODATA) {
+	  break;
+	}
       }
-      hints->tx_attr->op_flags = op_flags;
-      hints->domain_attr->threading = threading;
-      r = fi_getinfo(API_VERSION, node, service, flags, hints, &d->info);
       if (r != -FI_ENODATA) {
 	break;
       }
     }
-    if (r != -FI_ENODATA) {
+    if (r != -FI_ENODATA || !hmem) {
       break;
     }
   }
@@ -1580,6 +1647,7 @@ std::unique_ptr<Endpoint> Endpoint::open(const config_t& cfg, std::string* err)
   d->prov = info->fabric_attr->prov_name ? info->fabric_attr->prov_name : "";
   d->mr_mode = info->domain_attr->mr_mode;
   d->dc = info->tx_attr->op_flags & FI_DELIVERY_COMPLETE;
+  d->hmem = info->caps & FI_HMEM;
   d->thread_safe = info->domain_attr->threading == FI_THREAD_SAFE;
   if (info->ep_attr->max_msg_size) {
     d->max_write = std::min<uint64_t>(MAX_WRITE, info->ep_attr->max_msg_size);
@@ -1674,6 +1742,9 @@ std::string Endpoint::describe() const
   s += (impl->mr_mode & FI_MR_VIRT_ADDR) ? ", virtual-address regions" :
     ", offset regions";
   s += impl->dc ? ", delivery-complete writes" : ", transmit-complete writes";
+  if (impl->hmem) {
+    s += ", device-memory windows";
+  }
   if (impl->stage) {
     s += impl->thread_safe ? ", concurrent peer inserts" :
       ", peer inserts pause writes";
@@ -1686,12 +1757,23 @@ std::string Endpoint::describe() const
   return s;
 }
 
+bool Endpoint::hmem() const
+{
+  return impl->hmem;
+}
+
 int Endpoint::register_window(char* ptr, size_t len, window_t* out)
+{
+  return register_window(ptr, len, memory_t{}, out);
+}
+
+int Endpoint::register_window(char* ptr, size_t len, const memory_t& mem,
+                              window_t* out)
 {
   auto& d = *impl;
   std::lock_guard l(d.mtx);
   Impl::region_t reg;
-  if (int r = d.reg_window_locked(ptr, len, &reg); r < 0) {
+  if (int r = d.reg_window_locked(ptr, len, mem, &reg); r < 0) {
     return r;
   }
   const uint64_t id = d.next_window++;
@@ -1763,7 +1845,7 @@ int Endpoint::rekey_window(const window_t& w)
   // back as -EIO.
   auto failed = [](int r) { return r == -EINPROGRESS ? -EIO : r; };
   Impl::region_t fresh;
-  if (int r = d.reg_window_locked(cur.ptr, cur.len, &fresh); r < 0) {
+  if (int r = d.reg_window_locked(cur.ptr, cur.len, cur.mem, &fresh); r < 0) {
     return failed(r);
   }
   if (int r = d.close_window_region_locked(cur); r < 0) {

@@ -35,3 +35,29 @@ if gtest_dep.found()
       dependencies: [ofi_rma_dep, gtest_dep]),
     timeout: 900)
 endif
+
+# windows in AMD GPU memory, over shm with FI_HMEM_ROCR; the tests skip
+# when the GPU, or libfabric's ROCr support, is missing
+# the test calls only the HIP runtime's host API, so it links
+# libamdhip64 and compiles as plain C++
+hip_dep = dependency('', required: false)
+if not get_option('hip').disabled()
+  cpp = meson.get_compiler('cpp')
+  hip_args = ['-D__HIP_PLATFORM_AMD__']
+  if import('fs').is_dir('/opt/rocm/include')
+    hip_args += ['-isystem', '/opt/rocm/include']
+  endif
+  hip_lib = cpp.find_library('amdhip64', dirs: ['/opt/rocm/lib'],
+    required: false)
+  if hip_lib.found() and cpp.has_header('hip/hip_runtime_api.h', args: hip_args)
+    hip_dep = declare_dependency(dependencies: hip_lib, compile_args: hip_args)
+  endif
+endif
+if gtest_dep.found() and hip_dep.found() and not get_option('hip').disabled()
+  test('unittest_ofi_rma_hip',
+    executable('unittest_ofi_rma_hip', 'test/test_ofi_rma_hip.cc',
+      dependencies: [ofi_rma_dep, gtest_dep, hip_dep]),
+    timeout: 300)
+elif get_option('hip').enabled()
+  error('hip=enabled, but the HIP runtime or GoogleTest is missing')
+endif

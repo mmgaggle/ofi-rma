@@ -63,6 +63,21 @@ inline constexpr std::string_view TOKEN_TAG = "ofi1";
 std::optional<token_t> parse_token(std::string_view token);
 std::string format_token(const token_t& t);
 
+/**
+ * Where a window's memory lives. Host memory needs nothing more. Memory
+ * on a GPU or another device needs a provider that offers FI_HMEM (see
+ * config_t::hmem), and a NIC and platform that can reach the device's
+ * memory; a software provider such as shm copies into it instead.
+ */
+struct memory_t {
+  /// libfabric's fi_hmem_iface, for the kinds this library passes on
+  enum class iface_t { system, cuda, rocr, ze };
+  iface_t iface = iface_t::system;
+  /// the device ordinal, for cuda and ze; rocr and system ignore it,
+  /// since ROCr finds the device from the address
+  int device = 0;
+};
+
 struct config_t {
   std::string provider;  ///< libfabric provider name; required
   std::string domain;    ///< domain (device or interface) name; optional
@@ -77,6 +92,11 @@ struct config_t {
   /// endpoint that lends windows needs this unless the application
   /// polls.
   bool progress_thread = false;
+  /// ask the provider for FI_HMEM, so that windows can live in device
+  /// memory (see memory_t). A provider without it is still used, with
+  /// host windows only: see Endpoint::hmem(). Off by default, since the
+  /// question can make a provider choose other attributes.
+  bool hmem = false;
   /// ask for a thread-safe domain (FI_THREAD_SAFE), so that adding a new
   /// peer to the address vector, which can be slow, holds up no other
   /// write. A provider that offers only FI_THREAD_DOMAIN still works:
@@ -175,6 +195,12 @@ struct config_t {
   /// the operations, and the staging they read, until the endpoint
   /// closes.
   std::function<int()> cancel_hook;
+  /// for tests: runs for each memory region the endpoint registers, a
+  /// window's or the staging buffer's, with its memory, under the
+  /// endpoint's lock. On a GPU whose memory the host can also reach, a
+  /// window registered again as host memory would still take writes, so
+  /// a test asks this how it was registered.
+  std::function<void(const char*, size_t, const memory_t&)> reg_hook;
   /// for tests: runs in a cut-off just before the endpoint is closed. A
   /// nonzero return stands for fi_close() failing with it, and the
   /// endpoint stays open.
@@ -206,8 +232,15 @@ public:
     char* ptr = nullptr;
     size_t len = 0;
   };
-  /// register [ptr, ptr+len) for remote writes
+  /// the provider offers FI_HMEM: windows may live in device memory
+  bool hmem() const;
+  /// register [ptr, ptr+len) of host memory for remote writes
   int register_window(char* ptr, size_t len, window_t* out);
+  /// register [ptr, ptr+len) of the memory mem names for remote writes.
+  /// Device memory without hmem() is refused with -EOPNOTSUPP. The window
+  /// keeps its memory across rekey_window() and cut-offs.
+  int register_window(char* ptr, size_t len, const memory_t& mem,
+                      window_t* out);
   void deregister_window(uint64_t id);
   /**
    * Give a window a new memory key before its memory is reused for
@@ -331,7 +364,11 @@ public:
   /// endpoint placed while being polled. Nothing polls it while an insert
   /// on a FI_THREAD_DOMAIN domain is in the provider: after
   /// config_t::insert_wait, the reads are ordered after the last poll
-  /// before the insert.
+  /// before the insert. For a window in device memory this orders the
+  /// host's view only: a provider that copies into the device has
+  /// finished its copies, but a GPU kernel that is already running and
+  /// reads the window needs whatever its runtime asks for to see writes
+  /// a NIC placed.
   void sync();
   /// an insert on a FI_THREAD_DOMAIN domain keeps the endpoint quiet: it
   /// waits for the writes in flight, or runs, and no write starts
