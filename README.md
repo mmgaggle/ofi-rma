@@ -35,7 +35,7 @@ Notes for `verbs;ofi_rxm`:
 
 - The verbs provider caches memory registrations by default. With the cache, a region that is closed stays registered, so its key keeps working, and registering the memory again returns the same key. `rekey_window()` then fails with `-EOPNOTSUPP` rather than report a new key. To re-key windows, and to revoke a key when a window is deregistered, set `FI_MR_CACHE_MONITOR=disabled` in the environment before the first libfabric call.
 - A write that carries a revoked key is a remote access error, which breaks the reliable connection to that peer. Writes to the peer then fail with `-ECANCELED` until the provider reconnects, a few hundred milliseconds on soft-RoCE.
-- libfabric 2.3.1 can crash when it closes an endpoint whose connection broke. Upstream commit 697688386 ("prov/rxm: fix the msg_ep use-after-free at connection teardown") fixes it.
+- libfabric 2.3.1 can crash when it closes a `verbs;ofi_rxm` endpoint that still has credit completions queued. Upstream commit 697688386 ("prov/rxm: fix the msg_ep use-after-free at connection teardown") fixes it. Until a release has the fix, ofi-rma polls a `verbs;...` endpoint's completion queue for up to 50 ms before it closes the endpoint, so the provider handles those completions first.
 
 ## Device memory
 

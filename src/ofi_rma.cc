@@ -53,6 +53,8 @@ constexpr std::chrono::microseconds WAIT_SLEEP{50};
 constexpr std::chrono::microseconds POLL_BUSY_MARGIN{2};
 /// registrations a window may go through for a key out of quarantine
 constexpr int REKEY_ATTEMPTS = 8;
+/// how long closing an endpoint polls its completion queue first
+constexpr std::chrono::milliseconds DRAIN_BEFORE_CLOSE{50};
 /// Options of the UET libfabric provider, at FI_OPT_ENDPOINT, read with
 /// fi_getopt() into a bool (FI_PROV_SPECIFIC, 1 << 31, plus a code; see
 /// its prov/uet_fi.h): whether closing the endpoint discards the writes it
@@ -546,6 +548,24 @@ Endpoint::Impl::~Impl()
   // waits for inserts still inside the provider
   for (auto& t : insert_thrs) {
     t.join();
+  }
+  // verbs;ofi_rxm only: read what the completion queue still holds before
+  // closing. ofi_rxm in libfabric 2.3.1 closes a connection's verbs
+  // endpoint before it drains the queue, and a credit completion found
+  // then reposts a receive on the closed endpoint, which crashes the
+  // process (fixed upstream in 697688386). Polling first lets the provider
+  // handle those completions while its connections are still open.
+  // Not for a provider that places incoming writes in software when it is
+  // polled, such as tcp: the application may already have freed a window's
+  // memory, and closing without polling discards what is still arriving.
+  // The verbs NIC places RMA writes whether polled or not. Bounded.
+  if (ep && cq && !zombie && prov.rfind("verbs;", 0) == 0) {
+    std::unique_lock l(mtx);
+    const auto until = std::chrono::steady_clock::now() + DRAIN_BEFORE_CLOSE;
+    int idle = 0;
+    while (idle < 3 && std::chrono::steady_clock::now() < until) {
+      idle = poll_locked() ? 0 : idle + 1;
+    }
   }
   // the endpoint first: it cancels whatever is still in flight, after
   // which no write references the regions
