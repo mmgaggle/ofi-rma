@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 IBM Corporation
+# SPDX-License-Identifier: MIT
+
 cmake_minimum_required(VERSION 3.16)
 project(ofi_rma VERSION 0.1.0 LANGUAGES CXX)
 
@@ -91,6 +94,7 @@ if(OFI_RMA_INSTALL)
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
   install(FILES include/ofi_rma/ofi_rma.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ofi_rma)
+  install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
   install(EXPORT ofi_rmaTargets NAMESPACE ofi_rma::
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ofi_rma)
   configure_package_config_file(cmake/ofi_rmaConfig.cmake.in

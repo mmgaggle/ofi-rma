@@ -1,6 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 IBM Corporation
+# SPDX-License-Identifier: MIT
+
 project('ofi-rma', 'cpp',
   version: '0.1.0',
-  license: 'LGPL-2.1 OR LGPL-3.0',
+  license: 'MIT',
   meson_version: '>=0.60.0',
   default_options: ['cpp_std=c++17', 'warning_level=1'])
 
@@ -15,6 +18,7 @@ ofi_rma_lib = library('ofi_rma', 'src/ofi_rma.cc',
   install: true)
 
 install_headers('include/ofi_rma/ofi_rma.h', subdir: 'ofi_rma')
+install_data('LICENSE', install_dir: get_option('datadir') / 'doc' / 'ofi-rma')
 
 # what a project that uses this one as a subproject links with; NIXL
 # finds it as dependency('ofi-rma'), installed or from a wrap

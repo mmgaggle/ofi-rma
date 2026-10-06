@@ -89,4 +89,4 @@ Include the header as `#include <ofi_rma/ofi_rma.h>`. The namespace is `ofi_rma`
 
 This code started in Ceph as `src/common/ofi_rma.{h,cc}` and `src/test/common/test_ofi_rma.cc`. The history of those three files came along with them.
 
-ofi-rma is licensed under the LGPL version 2.1 or version 3, as Ceph's own files are. See `COPYING-LGPL2.1` and `COPYING-LGPL3`. A program under another license can link ofi-rma as a shared library.
+ofi-rma is licensed under the MIT license. See `LICENSE`. In Ceph the code was under the LGPL. The author of every commit relicensed it under MIT when it left Ceph.

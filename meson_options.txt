@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 IBM Corporation
+# SPDX-License-Identifier: MIT
+
 option('tests', type: 'feature', value: 'auto',
   description: 'Build the tests (needs GoogleTest)')
 option('hip', type: 'feature', value: 'auto',
