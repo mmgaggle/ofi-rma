@@ -610,7 +610,10 @@ int Endpoint::Impl::reg(char* ptr, size_t len, uint64_t access, region_t* out,
     r = fi_mr_reg(domain, ptr, len, access, 0, req_key, 0, &mr, nullptr);
   } else {
     iovec iov{ptr, len};
-    fi_mr_dmabuf dmabuf{mem.dmabuf_fd, mem.dmabuf_offset, len, ptr};
+    // base_addr is the address of the dma-buf's first byte: verbs hands
+    // ibv_reg_dmabuf_mr() the iova base_addr + offset, which must be ptr
+    fi_mr_dmabuf dmabuf{mem.dmabuf_fd, mem.dmabuf_offset, len,
+                        static_cast<char*>(ptr) - mem.dmabuf_offset};
     fi_mr_attr attr{};
     if (mem.dmabuf_fd >= 0) {
       attr.dmabuf = &dmabuf;

@@ -310,3 +310,62 @@ TEST(OfiDeviceMemory, VerbsWritesIntoADmabufWindow)
   owner->deregister_window(w.id);
   close(fd);
 }
+
+TEST(OfiDeviceMemory, VerbsWritesIntoPartOfADmabuf)
+{
+  // A window that starts inside its allocation: the dma-buf covers the
+  // whole allocation, and the window begins at an offset into it, as when
+  // a caller registers one tensor of a larger pool. The NIC must place the
+  // writes at the window's own address.
+  const char* node = getenv("OFI_RMA_TEST_VERBS_NODE");
+  if (!node || !*node) {
+    GTEST_SKIP() << "OFI_RMA_TEST_VERBS_NODE is not set";
+  }
+  if (!have_gpu()) {
+    GTEST_SKIP() << "no HIP device";
+  }
+  config_t oc;
+  oc.provider = "verbs;ofi_rxm";
+  oc.node = node;
+  oc.progress_thread = true;
+  oc.hmem = true;
+  config_t wc;
+  wc.provider = "verbs;ofi_rxm";
+  wc.node = node;
+  wc.stage_size = 4 << 20;
+  wc.stage_count = 2;
+  std::string err;
+  auto owner = Endpoint::open(oc, &err);
+  auto writer = owner ? Endpoint::open(wc, &err) : nullptr;
+  if (!owner || !writer) {
+    GTEST_SKIP() << "verbs;ofi_rxm at " << node << ": " << err;
+  }
+
+  const size_t N = 4 << 20;
+  gpu_buf_t g(2 * N);
+  ASSERT_TRUE(g.p);
+  char* second_half = g.p + N;
+  int fd = -1;
+  uint64_t off = 0;
+  ASSERT_EQ(HSA_STATUS_SUCCESS,
+            hsa_amd_portable_export_dmabuf(second_half, N, &fd, &off));
+  EXPECT_EQ(N, off);
+  Endpoint::window_t w;
+  const memory_t dmabuf{memory_t::iface_t::rocr, 0, fd, off};
+  if (int r = owner->register_window(second_half, N, dmabuf, &w); r != 0) {
+    close(fd);
+    GTEST_SKIP() << "no dma-buf window on this device: " << owner->last_error();
+  }
+  auto tok = parse_token(owner->window_token(w, 0, N));
+  ASSERT_TRUE(tok);
+  const auto src = pattern(N, 23);
+  iovec iov{const_cast<char*>(src.data()), N};
+  std::vector<Endpoint::write_t> all = {{0, N, 0}};
+  ASSERT_EQ(0, writer->write(*tok, &iov, 1, all, BUDGET)) << writer->last_error();
+  owner->sync();
+  auto got = g.read();
+  EXPECT_EQ(0, memcmp(got.data() + N, src.data(), N));
+  EXPECT_EQ(std::vector<char>(N, 0), std::vector<char>(got.begin(), got.begin() + N));
+  owner->deregister_window(w.id);
+  close(fd);
+}

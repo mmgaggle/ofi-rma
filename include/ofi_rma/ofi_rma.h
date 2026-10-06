@@ -88,7 +88,8 @@ struct memory_t {
   /// since a re-key or a cut-off registers the memory again. The provider
   /// must still offer FI_HMEM (Endpoint::hmem()).
   int dmabuf_fd = -1;
-  /// where the memory starts in the dma-buf
+  /// where the memory starts in the dma-buf: a window may begin inside
+  /// the allocation that the dma-buf exports
   uint64_t dmabuf_offset = 0;
 };
 
