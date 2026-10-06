@@ -72,14 +72,15 @@ if(OFI_RMA_BUILD_TESTS)
     find_path(HIP_RUNTIME_INCLUDE_DIR hip/hip_runtime_api.h
       HINTS /opt/rocm/include)
     find_library(HIP_RUNTIME_LIBRARY amdhip64 HINTS /opt/rocm/lib)
-    if(HIP_RUNTIME_INCLUDE_DIR AND HIP_RUNTIME_LIBRARY)
+    find_library(HSA_RUNTIME_LIBRARY hsa-runtime64 HINTS /opt/rocm/lib)
+    if(HIP_RUNTIME_INCLUDE_DIR AND HIP_RUNTIME_LIBRARY AND HSA_RUNTIME_LIBRARY)
       add_executable(unittest_ofi_rma_hip test/test_ofi_rma_hip.cc)
       target_compile_definitions(unittest_ofi_rma_hip PRIVATE
         __HIP_PLATFORM_AMD__)
       target_include_directories(unittest_ofi_rma_hip PRIVATE
         ${HIP_RUNTIME_INCLUDE_DIR})
       target_link_libraries(unittest_ofi_rma_hip ofi_rma
-        ${HIP_RUNTIME_LIBRARY} GTest::gtest_main)
+        ${HIP_RUNTIME_LIBRARY} ${HSA_RUNTIME_LIBRARY} GTest::gtest_main)
       add_test(NAME unittest_ofi_rma_hip COMMAND unittest_ofi_rma_hip)
     elseif(OFI_RMA_HIP STREQUAL "ON")
       message(FATAL_ERROR "OFI_RMA_HIP=ON, but the HIP runtime is missing")

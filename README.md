@@ -48,6 +48,13 @@ A window owner can lend a window in GPU memory. Set `config_t::hmem`, then regis
 - A window keeps its memory kind when `rekey_window()` or a cut-off registers it again.
 - `WindowPool` lends host memory only.
 
+A NIC can write into GPU memory only through a dma-buf: the GPU driver exports the memory, and the RDMA driver registers the export. Set `memory_t::dmabuf_fd` and `memory_t::dmabuf_offset` to a dma-buf that you exported, for example with ROCr's `hsa_amd_portable_export_dmabuf()`, and ofi-rma registers it with `FI_MR_DMABUF`. Keep the fd open while the window is registered. Do it this way rather than leave the export to libfabric, for two reasons:
+
+- libfabric exports ROCr memory only with `FI_HMEM_ROCR_USE_DMABUF=1` and only on a kernel built with `CONFIG_DMABUF_MOVE_NOTIFY=y`. The Fedora 6.19 kernel lacks that option, although `irdma` registers the export without it.
+- libfabric 2.3.1 offers `FI_HMEM` on verbs only for devices named `mlx*` or `bnxt_re*`. Upstream commits e755fe9cd and 2a8e74e39, in 2.7.0, add RoCE devices and a per-device dma-buf probe.
+
+The `verbs;ofi_rxm` test writes into a dma-buf window in AMD GPU memory when `OFI_RMA_TEST_VERBS_NODE` names a device that takes dma-bufs. Over an Intel E810 with `irdma`, the NIC places the data in the GPU memory with no copy.
+
 The GPU tests in `test/test_ofi_rma_hip.cc` run over `shm` on an AMD GPU. They skip if there is no GPU, or if libfabric has no ROCr support. To build libfabric with ROCr support, configure it with `--with-rocr=/usr`, or with the path of your ROCm installation.
 
 ## Build

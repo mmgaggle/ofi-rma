@@ -86,8 +86,9 @@ constexpr std::chrono::milliseconds WAIT_MAX{1};
 /// whether an insert on a FI_THREAD_DOMAIN domain is what holds it
 constexpr std::chrono::milliseconds QUIET_POLL{1};
 /// the API version asked for: old enough for a provider built against
-/// 1.x headers, new enough for FI_CONTEXT2 and the mr_mode bits used
-constexpr uint32_t API_VERSION = FI_VERSION(1, 18);
+/// 1.x headers, new enough for FI_CONTEXT2, the mr_mode bits used and
+/// dma-buf registration (FI_MR_DMABUF, 1.20)
+constexpr uint32_t API_VERSION = FI_VERSION(1, 20);
 
 std::optional<uint64_t> parse_hex64(std::string_view s)
 {
@@ -592,6 +593,8 @@ int Endpoint::Impl::reg(char* ptr, size_t len, uint64_t access, region_t* out,
                         const memory_t& mem)
 {
   const bool device = mem.iface != memory_t::iface_t::system;
+  // also with a dma-buf: tcp, for one, registers a dma-buf without
+  // FI_HMEM, and then cannot place a write into it
   if (device && !hmem) {
     set_err(prov + " does not offer FI_HMEM, so a window cannot live in "
             "device memory");
@@ -607,8 +610,13 @@ int Endpoint::Impl::reg(char* ptr, size_t len, uint64_t access, region_t* out,
     r = fi_mr_reg(domain, ptr, len, access, 0, req_key, 0, &mr, nullptr);
   } else {
     iovec iov{ptr, len};
+    fi_mr_dmabuf dmabuf{mem.dmabuf_fd, mem.dmabuf_offset, len, ptr};
     fi_mr_attr attr{};
-    attr.mr_iov = &iov;
+    if (mem.dmabuf_fd >= 0) {
+      attr.dmabuf = &dmabuf;
+    } else {
+      attr.mr_iov = &iov;
+    }
     attr.iov_count = 1;
     attr.access = access;
     attr.requested_key = req_key;
@@ -627,7 +635,8 @@ int Endpoint::Impl::reg(char* ptr, size_t len, uint64_t access, region_t* out,
       attr.iface = FI_HMEM_ROCR;
       break;
     }
-    r = fi_mr_regattr(domain, &attr, 0, &mr);
+    r = fi_mr_regattr(domain, &attr,
+                      mem.dmabuf_fd >= 0 ? FI_MR_DMABUF : 0, &mr);
   }
   if (r) {
     std::string e = std::string(device ? "fi_mr_regattr" : "fi_mr_reg") +

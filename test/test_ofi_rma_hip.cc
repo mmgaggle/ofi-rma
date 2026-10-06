@@ -10,11 +10,14 @@
 #include "ofi_rma/ofi_rma.h"
 
 #include <hip/hip_runtime_api.h>
+#include <hsa/hsa_ext_amd.h>
 
 #include <gtest/gtest.h>
 
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
+#include <unistd.h>
 #include <string_view>
 #include <vector>
 
@@ -250,4 +253,60 @@ TEST(OfiDeviceMemory, RekeyKeepsTheWindowOnTheGpu)
   owner->sync();
   got = g.read();
   EXPECT_EQ(0, memcmp(got.data(), second.data(), N));
+}
+
+TEST(OfiDeviceMemory, VerbsWritesIntoADmabufWindow)
+{
+  // A NIC writing straight into GPU memory: the window is a dma-buf that
+  // ROCr exported, registered with FI_MR_DMABUF, which needs no FI_HMEM
+  // export from libfabric. Over verbs;ofi_rxm on the device whose address
+  // OFI_RMA_TEST_VERBS_NODE names; both endpoints sit on it, so the NIC
+  // loops the writes back. Soft-RoCE takes no dma-buf: the test skips.
+  const char* node = getenv("OFI_RMA_TEST_VERBS_NODE");
+  if (!node || !*node) {
+    GTEST_SKIP() << "OFI_RMA_TEST_VERBS_NODE is not set";
+  }
+  if (!have_gpu()) {
+    GTEST_SKIP() << "no HIP device";
+  }
+  config_t oc;
+  oc.provider = "verbs;ofi_rxm";
+  oc.node = node;
+  oc.progress_thread = true;
+  oc.hmem = true;
+  config_t wc;
+  wc.provider = "verbs;ofi_rxm";
+  wc.node = node;
+  wc.stage_size = 4 << 20;
+  wc.stage_count = 2;
+  std::string err;
+  auto owner = Endpoint::open(oc, &err);
+  auto writer = owner ? Endpoint::open(wc, &err) : nullptr;
+  if (!owner || !writer) {
+    GTEST_SKIP() << "verbs;ofi_rxm at " << node << ": " << err;
+  }
+
+  const size_t N = 4 << 20;
+  gpu_buf_t g(N);
+  ASSERT_TRUE(g.p);
+  int fd = -1;
+  uint64_t off = 0;
+  ASSERT_EQ(HSA_STATUS_SUCCESS, hsa_amd_portable_export_dmabuf(g.p, N, &fd, &off));
+  Endpoint::window_t w;
+  const memory_t dmabuf{memory_t::iface_t::rocr, 0, fd, off};
+  if (int r = owner->register_window(g.p, N, dmabuf, &w); r != 0) {
+    close(fd);
+    GTEST_SKIP() << "no dma-buf window on this device: " << owner->last_error();
+  }
+  auto tok = parse_token(owner->window_token(w, 0, N));
+  ASSERT_TRUE(tok);
+  const auto src = pattern(N, 17);
+  iovec iov{const_cast<char*>(src.data()), N};
+  std::vector<Endpoint::write_t> all = {{0, N, 0}};
+  ASSERT_EQ(0, writer->write(*tok, &iov, 1, all, BUDGET)) << writer->last_error();
+  owner->sync();
+  auto got = g.read();
+  EXPECT_EQ(0, memcmp(got.data(), src.data(), N));
+  owner->deregister_window(w.id);
+  close(fd);
 }

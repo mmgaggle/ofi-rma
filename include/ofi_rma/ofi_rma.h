@@ -78,6 +78,18 @@ struct memory_t {
   /// the device ordinal, for cuda and ze; rocr and system ignore it,
   /// since ROCr finds the device from the address
   int device = 0;
+  /// a dma-buf that exports the memory, or -1. With one, the region is
+  /// registered from the dma-buf (FI_MR_DMABUF), which a verbs provider
+  /// hands to ibv_reg_dmabuf_mr(): the NIC then writes into the device's
+  /// memory, and libfabric need not export it itself. Its own ROCr export
+  /// needs FI_HMEM_ROCR_USE_DMABUF=1 and a kernel built with
+  /// CONFIG_DMABUF_MOVE_NOTIFY, which some distribution kernels lack. The
+  /// fd stays the caller's; keep it open while the window is registered,
+  /// since a re-key or a cut-off registers the memory again. The provider
+  /// must still offer FI_HMEM (Endpoint::hmem()).
+  int dmabuf_fd = -1;
+  /// where the memory starts in the dma-buf
+  uint64_t dmabuf_offset = 0;
 };
 
 struct config_t {

@@ -53,8 +53,10 @@ if not get_option('hip').disabled()
   endif
   hip_lib = cpp.find_library('amdhip64', dirs: ['/opt/rocm/lib'],
     required: false)
-  if hip_lib.found() and cpp.has_header('hip/hip_runtime_api.h', args: hip_args)
-    hip_dep = declare_dependency(dependencies: hip_lib, compile_args: hip_args)
+  hsa_lib = cpp.find_library('hsa-runtime64', dirs: ['/opt/rocm/lib'],
+    required: false)
+  if hip_lib.found() and hsa_lib.found() and cpp.has_header('hip/hip_runtime_api.h', args: hip_args)
+    hip_dep = declare_dependency(dependencies: [hip_lib, hsa_lib], compile_args: hip_args)
   endif
 endif
 if gtest_dep.found() and hip_dep.found() and not get_option('hip').disabled()
