@@ -26,10 +26,16 @@ The token starts with the same `addr:size` fields as a cuObject descriptor. A se
 |----------|-------|
 | `tcp` | Needs no special hardware. It cannot cut off a late write, so use it for tests only. |
 | `shm` | Works between processes on one host. |
-| `verbs;ofi_rxm` | RDMA reliable connections on any verbs device. On soft-RoCE, set `FI_UNIVERSE_SIZE=16` in every process. |
+| `verbs;ofi_rxm` | RDMA reliable connections on any verbs device. On soft-RoCE, set `FI_UNIVERSE_SIZE=16` in every process. See the notes below. |
 | `uet` | Ultra Ethernet, through a libfabric wrapper for the UEC reference provider. |
 
 A provider with manual progress places incoming data only while the owner polls its endpoint. Set `config_t::progress_thread` for an endpoint that lends windows, or poll it with `progress()`.
+
+Notes for `verbs;ofi_rxm`:
+
+- The verbs provider caches memory registrations by default. With the cache, a region that is closed stays registered, so its key keeps working, and registering the memory again returns the same key. `rekey_window()` then fails with `-EOPNOTSUPP` rather than report a new key. To re-key windows, and to revoke a key when a window is deregistered, set `FI_MR_CACHE_MONITOR=disabled` in the environment before the first libfabric call.
+- A write that carries a revoked key is a remote access error, which breaks the reliable connection to that peer. Writes to the peer then fail with `-ECANCELED` until the provider reconnects, a few hundred milliseconds on soft-RoCE.
+- libfabric 2.3.1 can crash when it closes an endpoint whose connection broke. Upstream commit 697688386 ("prov/rxm: fix the msg_ep use-after-free at connection teardown") fixes it.
 
 ## Device memory
 
@@ -72,7 +78,7 @@ The CMake build has these options:
 | `OFI_RMA_INSTALL` | `ON` | `OFF` |
 | `OFI_RMA_HIP` | `AUTO`: build the GPU tests if the HIP runtime is found | `AUTO`, with tests off |
 
-The tests run over `tcp` and `shm`. They skip a provider that is not available. A full run takes about 40 seconds.
+The tests run over `tcp` and `shm`. They skip a provider that is not available. A full run takes about 40 seconds. To also run them over `verbs;ofi_rxm`, set `OFI_RMA_TEST_VERBS_NODE` to the IP address of an RDMA device, such as a soft-RoCE device. The tests then set `FI_UNIVERSE_SIZE=16` and `FI_MR_CACHE_MONITOR=disabled` unless they are already set.
 
 ## Use from another project
 

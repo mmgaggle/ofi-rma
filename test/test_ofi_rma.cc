@@ -5,7 +5,9 @@
 
 #include "ofi_rma/ofi_rma.h"
 
+#include <cctype>
 #include <cerrno>
+#include <cstdlib>
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
@@ -66,6 +68,43 @@ TEST(OfiToken, Rejects)
   EXPECT_FALSE(parse_token("0:10:ofi1:tcp:" + std::string(386, 'a') + ":1"));
   EXPECT_TRUE(parse_token("0:10:ofi1:tcp:" + std::string(384, 'a') + ":1"));
 }
+
+namespace {
+
+/// The providers the parameterized tests run on: tcp and shm, which need no
+/// hardware, and verbs;ofi_rxm when OFI_RMA_TEST_VERBS_NODE names the
+/// address of an RDMA device, a soft-RoCE one say. The address picks the
+/// device. Soft-RoCE needs FI_UNIVERSE_SIZE=16; it is set here when unset.
+std::vector<std::pair<const char*, const char*>> test_providers()
+{
+  std::vector<std::pair<const char*, const char*>> v = {
+    {"tcp", "127.0.0.1"}, {"shm", ""}};
+  if (const char* node = getenv("OFI_RMA_TEST_VERBS_NODE"); node && *node) {
+    setenv("FI_UNIVERSE_SIZE", "16", 0);
+    // verbs caches registrations, which keeps a closed region's key
+    // working; re-keying needs the cache off (see rekey_window()).
+    // libfabric reads this once, before the first call.
+    setenv("FI_MR_CACHE_MONITOR", "disabled", 0);
+    v.emplace_back("verbs;ofi_rxm", node);
+  }
+  return v;
+}
+
+/// gtest names allow letters, digits and underscores: "verbs;ofi_rxm" is
+/// "verbs_ofi_rxm"
+std::string provider_test_name(
+  const ::testing::TestParamInfo<std::pair<const char*, const char*>>& info)
+{
+  std::string n = info.param.first;
+  for (auto& c : n) {
+    if (!isalnum(static_cast<unsigned char>(c))) {
+      c = '_';
+    }
+  }
+  return n;
+}
+
+} // anonymous namespace
 
 namespace {
 
@@ -1667,8 +1706,19 @@ TEST_P(OfiRekey, OldTokenStopsWorking)
   a.ep->sync();
   EXPECT_EQ(std::string::npos,
 	    std::string_view(a.mem.data(), N).find('L'));
-  // the new key works
-  EXPECT_EQ(0, writer->write(*t2, &iov, 1, all, BUDGET)) << writer->last_error();
+  // the new key works. On a connected provider (verbs;ofi_rxm) the write
+  // with the old key was a remote access error that broke the connection:
+  // writes to the owner fail, flushed (-ECANCELED), until the provider
+  // has reconnected
+  int r = -1;
+  for (int i = 0; i < 50 && r != 0; i++) {
+    r = writer->write(*t2, &iov, 1, all, BUDGET);
+    if (r != 0) {
+      EXPECT_EQ(-ECANCELED, r) << writer->last_error();
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  }
+  EXPECT_EQ(0, r) << writer->last_error();
   a.ep->sync();
   EXPECT_EQ(0, memcmp(a.mem.data(), src.data(), N));
 }
@@ -1706,9 +1756,8 @@ TEST_P(OfiRekey, KeysDoNotRepeat)
 
 INSTANTIATE_TEST_SUITE_P(
   Providers, OfiRekey,
-  ::testing::Values(std::make_pair("tcp", "127.0.0.1"),
-		    std::make_pair("shm", "")),
-  [](const auto& info) { return std::string(info.param.first); });
+  ::testing::ValuesIn(test_providers()),
+  provider_test_name);
 
 TEST_P(OfiRekey, WindowPoolRekeysOnRelease)
 {
@@ -2217,18 +2266,15 @@ TEST(OfiCutOffCost, LearnsFromCutOffs)
 
 INSTANTIATE_TEST_SUITE_P(
   Providers, OfiConcurrentWrites,
-  ::testing::Values(std::make_pair("tcp", "127.0.0.1"),
-		    std::make_pair("shm", "")),
-  [](const auto& info) { return std::string(info.param.first); });
+  ::testing::ValuesIn(test_providers()),
+  provider_test_name);
 
 INSTANTIATE_TEST_SUITE_P(
   Providers, OfiPeerInsert,
-  ::testing::Values(std::make_pair("tcp", "127.0.0.1"),
-		    std::make_pair("shm", "")),
-  [](const auto& info) { return std::string(info.param.first); });
+  ::testing::ValuesIn(test_providers()),
+  provider_test_name);
 
 INSTANTIATE_TEST_SUITE_P(
   Providers, OfiWrite,
-  ::testing::Values(std::make_pair("tcp", "127.0.0.1"),
-		    std::make_pair("shm", "")),
-  [](const auto& info) { return std::string(info.param.first); });
+  ::testing::ValuesIn(test_providers()),
+  provider_test_name);
