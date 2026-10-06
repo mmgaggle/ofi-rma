@@ -19,16 +19,21 @@
 /**
  * Out-of-band RMA over libfabric.
  *
- * One transport-neutral endpoint for every out-of-band leg Ceph runs
- * itself: an OSD writing a read reply into a client's memory, a shard
- * pushing its sub-read into a gathering primary, an OSD placing a
- * stripe in a gateway's relay window. The libfabric provider picks the
- * wire: tcp or shm with no special hardware, verbs (RC under the rxm
- * utility provider), efa (SRD), or a UET provider.
+ * One transport-neutral endpoint for moving data out of band into memory
+ * that a peer lends. A window owner registers memory and hands out a
+ * token that names it; any writer that holds the token and runs the same
+ * provider writes into the memory, with no connection to the owner.
+ * Ceph uses it for every out-of-band leg it runs itself: an OSD writing a
+ * read reply into a client's memory, a shard pushing its sub-read into a
+ * gathering primary, an OSD placing a stripe in a gateway's relay window.
+ * A client such as an S3-over-RDMA data path lends the memory. The
+ * libfabric provider picks the wire: tcp or shm with no special
+ * hardware, verbs (RC under the rxm utility provider), efa (SRD), or a
+ * UET provider.
  *
- * The code has no Ceph dependencies, so test clients can link it alone.
+ * The library depends only on libfabric and the C++ standard library.
  */
-namespace ceph::ofi {
+namespace ofi_rma {
 
 /**
  * A libfabric delivery descriptor:
@@ -527,4 +532,4 @@ private:
   stats_t st;
 };
 
-} // namespace ceph::ofi
+} // namespace ofi_rma

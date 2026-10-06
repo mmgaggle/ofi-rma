@@ -1,7 +1,7 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
 // vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
-#include "common/ofi_rma.h"
+#include "ofi_rma/ofi_rma.h"
 
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
@@ -25,7 +25,7 @@
 
 #include <poll.h>
 
-namespace ceph::ofi {
+namespace ofi_rma {
 
 namespace {
 
@@ -2342,4 +2342,4 @@ WindowPool::stats_t WindowPool::stats() const
   return st;
 }
 
-} // namespace ceph::ofi
+} // namespace ofi_rma

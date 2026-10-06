@@ -1,0 +1,11 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+libdir=@CMAKE_INSTALL_FULL_LIBDIR@
+includedir=@CMAKE_INSTALL_FULL_INCLUDEDIR@
+
+Name: ofi-rma
+Description: Out-of-band RMA windows and ofi1 tokens over libfabric
+Version: @PROJECT_VERSION@
+Requires: @OFI_RMA_PC_REQUIRES@
+Requires.private: @OFI_RMA_PC_REQUIRES_PRIVATE@
+Libs: -L${libdir} -lofi_rma -pthread
+Cflags: -I${includedir}
