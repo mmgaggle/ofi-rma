@@ -256,6 +256,10 @@ public:
    * when no write of the window's current operation is still expected.
    * Returns 0, or a negative errno with the window and its key unchanged;
    * do not reuse the memory then until key_quarantine has passed.
+   * -EOPNOTSUPP means the provider's registration cache handed back the
+   * old key; with such a provider (verbs and efa by default), closing a
+   * region does not revoke its key either. Set FI_MR_CACHE_MONITOR=disabled
+   * in the environment, before the first libfabric call.
    * -EINPROGRESS is the exception: an insert on a FI_THREAD_DOMAIN domain
    * held the endpoint, in the provider, past config_t::insert_wait, and a
    * later call that succeeds, once quiet() is false, makes the memory

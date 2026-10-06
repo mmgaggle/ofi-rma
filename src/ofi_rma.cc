@@ -1850,6 +1850,17 @@ int Endpoint::rekey_window(const window_t& w)
   if (int r = d.reg_window_locked(cur.ptr, cur.len, cur.mem, &fresh); r < 0) {
     return failed(r);
   }
+  if (fresh.key == cur.key) {
+    // the provider handed back the region it already had: a registration
+    // cache (verbs and efa keep one by default) keeps regions registered,
+    // so closing the old one would leave its key working. Report it rather
+    // than a re-key that did not happen.
+    fi_close(&fresh.mr->fid);
+    d.set_err("the provider gave the memory registered again its old key: "
+              "its registration cache keeps the region, so the old key "
+              "stays valid; set FI_MR_CACHE_MONITOR=disabled");
+    return -EOPNOTSUPP;
+  }
   if (int r = d.close_window_region_locked(cur); r < 0) {
     // the old key still works; keep the window as it was
     fi_close(&fresh.mr->fid);
