@@ -369,3 +369,65 @@ TEST(OfiDeviceMemory, VerbsWritesIntoPartOfADmabuf)
   owner->deregister_window(w.id);
   close(fd);
 }
+
+TEST(OfiDeviceMemory, VerbsReadsFromPartOfADmabuf)
+{
+  // The PUT direction: a peer pulls the bytes of a GPU buffer, registered
+  // for remote reads as a dma-buf that starts before the window does
+  const char* node = getenv("OFI_RMA_TEST_VERBS_NODE");
+  if (!node || !*node) {
+    GTEST_SKIP() << "OFI_RMA_TEST_VERBS_NODE is not set";
+  }
+  if (!have_gpu()) {
+    GTEST_SKIP() << "no HIP device";
+  }
+  config_t oc;
+  oc.provider = "verbs;ofi_rxm";
+  oc.node = node;
+  oc.progress_thread = true;
+  oc.hmem = true;
+  oc.reads = true;
+  config_t rc;
+  rc.provider = "verbs;ofi_rxm";
+  rc.node = node;
+  rc.reads = true;
+  rc.stage_size = 4 << 20;
+  rc.stage_count = 2;
+  std::string err;
+  auto owner = Endpoint::open(oc, &err);
+  auto reader = owner ? Endpoint::open(rc, &err) : nullptr;
+  if (!owner || !reader) {
+    GTEST_SKIP() << "verbs;ofi_rxm at " << node << ": " << err;
+  }
+  if (!owner->reads() || !reader->reads() || !owner->hmem()) {
+    GTEST_SKIP() << "no reads or no FI_HMEM: " << owner->describe();
+  }
+
+  const size_t N = 4 << 20;
+  gpu_buf_t g(2 * N);
+  ASSERT_TRUE(g.p);
+  char* second_half = g.p + N;
+  const auto src = pattern(N, 41);
+  ASSERT_EQ(hipSuccess, hipMemcpy(second_half, src.data(), N,
+                                  hipMemcpyHostToDevice));
+  int fd = -1;
+  uint64_t off = 0;
+  ASSERT_EQ(HSA_STATUS_SUCCESS,
+            hsa_amd_portable_export_dmabuf(second_half, N, &fd, &off));
+  Endpoint::window_t w;
+  const memory_t dmabuf{memory_t::iface_t::rocr, 0, fd, off};
+  if (int r = owner->register_window(second_half, N, dmabuf,
+                                     Endpoint::remote_read, &w); r != 0) {
+    close(fd);
+    GTEST_SKIP() << "no dma-buf window on this device: " << owner->last_error();
+  }
+  auto tok = parse_token(owner->window_token(w, 0, N));
+  ASSERT_TRUE(tok);
+  std::vector<char> got(N, 0);
+  iovec iov{got.data(), N};
+  ASSERT_EQ(0, reader->read(*tok, &iov, 1, {{0, N, 0}}, BUDGET))
+    << reader->last_error();
+  EXPECT_EQ(0, memcmp(got.data(), src.data(), N));
+  owner->deregister_window(w.id);
+  close(fd);
+}

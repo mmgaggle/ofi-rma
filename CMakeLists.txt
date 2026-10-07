@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 cmake_minimum_required(VERSION 3.16)
-project(ofi_rma VERSION 0.1.0 LANGUAGES CXX)
+project(ofi_rma VERSION 0.2.0 LANGUAGES CXX)
 
 # A project that adds this directory (Ceph does, as a submodule) gets a
 # static library and no tests or install rules unless it asks for them.

@@ -224,6 +224,8 @@ struct Endpoint::Impl {
   bool dc = false;
   /// the provider offers FI_HMEM
   bool hmem = false;
+  /// the provider offers RMA reads (FI_READ and FI_REMOTE_READ)
+  bool reads = false;
   /// the domain is FI_THREAD_SAFE: an address insert needs no lock
   bool thread_safe = false;
   uint64_t max_write = MAX_WRITE;
@@ -259,6 +261,9 @@ struct Endpoint::Impl {
     uint64_t key = 0;
     void* desc = nullptr;
     memory_t mem;
+    /// what peers may do with it: FI_REMOTE_WRITE, FI_REMOTE_READ, or a
+    /// local buffer's FI_WRITE and FI_READ; kept across re-registrations
+    uint64_t access = 0;
   };
   std::map<uint64_t, region_t> windows;
   std::atomic<uint64_t> nwindows{0};  ///< windows.size(), readable without mtx
@@ -277,13 +282,18 @@ struct Endpoint::Impl {
   std::atomic<int> rekey_in_place{-1};
   /// register a window's memory, under a key out of quarantine
   int reg_window_locked(char* ptr, size_t len, const memory_t& mem,
-                        region_t* out);
+                        uint64_t access, region_t* out);
   /// close a window's region, and put its key in quarantine
   int close_window_region_locked(region_t& r);
 
   char* stage = nullptr;
   region_t stage_mr;
   std::vector<bool> stage_busy;
+  /// staging is the local source of writes, and with reads the local
+  /// destination of reads too
+  uint64_t stage_access() const {
+    return FI_WRITE | (reads ? FI_READ : 0);
+  }
 
   /// The address vector's peers. They have a lock of their own, so that
   /// a write can wait for a peer's insert without mtx, which an insert
@@ -320,7 +330,7 @@ struct Endpoint::Impl {
   std::vector<std::thread> insert_thrs;
 
   struct plan_t;
-  /// one posted write; the context must stay put until it completes
+  /// one posted write or read; the context must stay put until it completes
   struct op_t {
     fi_context2 ctx;
     plan_t* plan = nullptr;
@@ -336,6 +346,9 @@ struct Endpoint::Impl {
     std::chrono::steady_clock::time_point posted_at{};
     size_t slot = 0;
     std::string peer;
+    /// its operations read from the peer into the slot, rather than write
+    /// the slot to the peer
+    bool reading = false;
     /// its writer cancelled it and left; it is retired when the last of
     /// its cancelled operations completes, or when the endpoint closes
     bool abandoned = false;
@@ -398,6 +411,9 @@ struct Endpoint::Impl {
   std::atomic<uint64_t> writes_posted{0};
   std::atomic<uint64_t> writes_failed{0};
   std::atomic<uint64_t> bytes_written{0};
+  std::atomic<uint64_t> reads_posted{0};
+  std::atomic<uint64_t> reads_failed{0};
+  std::atomic<uint64_t> bytes_read{0};
   std::atomic<uint64_t> peers_inserted{0};
   std::atomic<uint64_t> staging_busy{0};
   std::atomic<uint64_t> timeouts{0};
@@ -491,6 +507,19 @@ struct Endpoint::Impl {
           const memory_t& mem = {});
   /// one pass over the completion queue; returns the completions read
   size_t poll_locked();
+  /// one range of a transfer: local is the offset in the staging slot,
+  /// remote the offset in the peer's window
+  struct range_t {
+    uint64_t local = 0;
+    uint64_t len = 0;
+    uint64_t remote = 0;
+  };
+  /// write() and read(): gather iov into a staging slot and write it to
+  /// the peer's window, or read the peer's window into the slot and
+  /// scatter it into iov
+  int transfer(bool reading, const token_t& peer, const struct iovec* iov,
+	       size_t iovcnt, const std::vector<range_t>& ranges,
+	       std::chrono::milliseconds budget, bool* posted);
   void complete_locked(op_t* op, int err);
   /// between two polls of a waiting write: drop the lock until the
   /// completion queue has something, or briefly, never past deadline
@@ -665,17 +694,19 @@ int Endpoint::Impl::reg(char* ptr, size_t len, uint64_t access, region_t* out,
     }
   }
   const uint64_t key = fi_mr_key(mr);
-  if ((access & FI_REMOTE_WRITE) && key == FI_KEY_NOTAVAIL) {
+  if ((access & (FI_REMOTE_WRITE | FI_REMOTE_READ)) &&
+      key == FI_KEY_NOTAVAIL) {
     set_err("the provider gave the region no key");
     fi_close(&mr->fid);
     return -EOPNOTSUPP;
   }
-  *out = region_t{mr, ptr, len, key, fi_mr_desc(mr), mem};
+  *out = region_t{mr, ptr, len, key, fi_mr_desc(mr), mem, access};
   return 0;
 }
 
 int Endpoint::Impl::reg_window_locked(char* ptr, size_t len,
-                                      const memory_t& mem, region_t* out)
+                                      const memory_t& mem, uint64_t access,
+                                      region_t* out)
 {
   const auto now = std::chrono::steady_clock::now();
   while (!retired_order.empty() && retired_order.front().first <= now) {
@@ -687,7 +718,7 @@ int Endpoint::Impl::reg_window_locked(char* ptr, size_t len,
   }
   for (int attempt = 0; attempt < REKEY_ATTEMPTS; attempt++) {
     region_t fresh;
-    if (int r = reg(ptr, len, FI_REMOTE_WRITE, &fresh, mem); r < 0) {
+    if (int r = reg(ptr, len, access, &fresh, mem); r < 0) {
       return r;
     }
     if (!retired.count(fresh.key)) {
@@ -735,7 +766,7 @@ void Endpoint::Impl::complete_locked(op_t* op, int err)
   op->done = true;
   p->outstanding--;
   if (err) {
-    writes_failed++;
+    (p->reading ? reads_failed : writes_failed)++;
     if (!p->err) {
       p->err = err;
     }
@@ -1418,7 +1449,7 @@ void Endpoint::Impl::reset_locked()
   if (rebind) {
     for (auto& [id, w] : windows) {
       region_t fresh;
-      if (reg_window_locked(w.ptr, w.len, w.mem, &fresh) < 0) {
+      if (reg_window_locked(w.ptr, w.len, w.mem, w.access, &fresh) < 0) {
         broken = true;
         return;
       }
@@ -1426,7 +1457,8 @@ void Endpoint::Impl::reset_locked()
     }
     if (stage) {
       region_t fresh;
-      if (reg(stage, cfg.stage_size * cfg.stage_count, FI_WRITE, &fresh) < 0) {
+      if (reg(stage, cfg.stage_size * cfg.stage_count, stage_access(),
+              &fresh) < 0) {
         broken = true;
         return;
       }
@@ -1631,7 +1663,12 @@ std::unique_ptr<Endpoint> Endpoint::open(const config_t& cfg, std::string* err)
   // that asks for it lends windows on a GPU, and would otherwise have to
   // stage every transfer through host memory. Without it, the windows are
   // in host memory only (see hmem()).
+  //
+  // Reads, when asked for, come next: an endpoint that cannot read cannot
+  // pull a PUT's payload at all, while one without delivery-complete
+  // writes or a thread-safe domain only fences and inserts less well.
   int r = -FI_ENODATA;
+  bool asked_reads = false;
   for (bool hmem : {cfg.hmem, false}) {
     if (hmem) {
       hints->caps |= FI_HMEM;
@@ -1640,19 +1677,30 @@ std::unique_ptr<Endpoint> Endpoint::open(const config_t& cfg, std::string* err)
       hints->caps &= ~FI_HMEM;
       hints->domain_attr->mr_mode &= ~FI_MR_HMEM;
     }
-    for (uint64_t op_flags : {uint64_t{FI_DELIVERY_COMPLETE}, uint64_t{0}}) {
-      for (fi_threading threading : {FI_THREAD_SAFE, FI_THREAD_DOMAIN}) {
-	if (threading == FI_THREAD_SAFE && !cfg.thread_safe) {
-	  continue;
+    for (bool reads : {cfg.reads, false}) {
+      if (reads) {
+	hints->caps |= FI_READ | FI_REMOTE_READ;
+      } else {
+	hints->caps &= ~uint64_t(FI_READ | FI_REMOTE_READ);
+      }
+      asked_reads = reads;
+      for (uint64_t op_flags : {uint64_t{FI_DELIVERY_COMPLETE}, uint64_t{0}}) {
+	for (fi_threading threading : {FI_THREAD_SAFE, FI_THREAD_DOMAIN}) {
+	  if (threading == FI_THREAD_SAFE && !cfg.thread_safe) {
+	    continue;
+	  }
+	  hints->tx_attr->op_flags = op_flags;
+	  hints->domain_attr->threading = threading;
+	  r = fi_getinfo(API_VERSION, node, service, flags, hints, &d->info);
+	  if (r != -FI_ENODATA) {
+	    break;
+	  }
 	}
-	hints->tx_attr->op_flags = op_flags;
-	hints->domain_attr->threading = threading;
-	r = fi_getinfo(API_VERSION, node, service, flags, hints, &d->info);
 	if (r != -FI_ENODATA) {
 	  break;
 	}
       }
-      if (r != -FI_ENODATA) {
+      if (r != -FI_ENODATA || !reads) {
 	break;
       }
     }
@@ -1682,6 +1730,8 @@ std::unique_ptr<Endpoint> Endpoint::open(const config_t& cfg, std::string* err)
   d->mr_mode = info->domain_attr->mr_mode;
   d->dc = info->tx_attr->op_flags & FI_DELIVERY_COMPLETE;
   d->hmem = info->caps & FI_HMEM;
+  d->reads = asked_reads && (info->caps & FI_READ) &&
+    (info->caps & FI_REMOTE_READ);
   d->thread_safe = info->domain_attr->threading == FI_THREAD_SAFE;
   if (info->ep_attr->max_msg_size) {
     d->max_write = std::min<uint64_t>(MAX_WRITE, info->ep_attr->max_msg_size);
@@ -1719,7 +1769,7 @@ std::unique_ptr<Endpoint> Endpoint::open(const config_t& cfg, std::string* err)
       return nullptr;
     }
     d->stage = static_cast<char*>(p);
-    if ((r = d->reg(d->stage, total, FI_WRITE, &d->stage_mr))) {
+    if ((r = d->reg(d->stage, total, d->stage_access(), &d->stage_mr))) {
       *err = "registering staging: " + d->get_err();
       return nullptr;
     }
@@ -1779,6 +1829,9 @@ std::string Endpoint::describe() const
   if (impl->hmem) {
     s += ", device-memory windows";
   }
+  if (impl->reads) {
+    s += ", reads";
+  }
   if (impl->stage) {
     s += impl->thread_safe ? ", concurrent peer inserts" :
       ", peer inserts pause writes";
@@ -1796,6 +1849,11 @@ bool Endpoint::hmem() const
   return impl->hmem;
 }
 
+bool Endpoint::reads() const
+{
+  return impl->reads;
+}
+
 int Endpoint::register_window(char* ptr, size_t len, window_t* out)
 {
   return register_window(ptr, len, memory_t{}, out);
@@ -1804,10 +1862,26 @@ int Endpoint::register_window(char* ptr, size_t len, window_t* out)
 int Endpoint::register_window(char* ptr, size_t len, const memory_t& mem,
                               window_t* out)
 {
+  return register_window(ptr, len, mem, remote_write, out);
+}
+
+int Endpoint::register_window(char* ptr, size_t len, const memory_t& mem,
+                              unsigned access, window_t* out)
+{
   auto& d = *impl;
+  if (!access || (access & ~unsigned(remote_write | remote_read))) {
+    return -EINVAL;
+  }
+  if ((access & remote_read) && !d.reads) {
+    d.set_err(d.prov + " offers no RMA reads here (see config_t::reads), so "
+              "a window cannot be read by peers");
+    return -EOPNOTSUPP;
+  }
+  const uint64_t fi_access = ((access & remote_write) ? FI_REMOTE_WRITE : 0) |
+    ((access & remote_read) ? FI_REMOTE_READ : 0);
   std::lock_guard l(d.mtx);
   Impl::region_t reg;
-  if (int r = d.reg_window_locked(ptr, len, mem, &reg); r < 0) {
+  if (int r = d.reg_window_locked(ptr, len, mem, fi_access, &reg); r < 0) {
     return r;
   }
   const uint64_t id = d.next_window++;
@@ -1879,7 +1953,8 @@ int Endpoint::rekey_window(const window_t& w)
   // back as -EIO.
   auto failed = [](int r) { return r == -EINPROGRESS ? -EIO : r; };
   Impl::region_t fresh;
-  if (int r = d.reg_window_locked(cur.ptr, cur.len, cur.mem, &fresh); r < 0) {
+  if (int r = d.reg_window_locked(cur.ptr, cur.len, cur.mem, cur.access,
+                                  &fresh); r < 0) {
     return failed(r);
   }
   if (fresh.key == cur.key) {
@@ -1927,15 +2002,17 @@ std::string Endpoint::window_token(const window_t& w, uint64_t ofs,
   return format_token(t);
 }
 
-int Endpoint::write(const token_t& dst, const struct iovec* iov,
-		    size_t iovcnt, const std::vector<write_t>& writes,
-		    std::chrono::milliseconds budget, bool* posted)
+int Endpoint::Impl::transfer(bool reading, const token_t& dst,
+			     const struct iovec* iov, size_t iovcnt,
+			     const std::vector<range_t>& writes,
+			     std::chrono::milliseconds budget, bool* posted)
 {
-  auto& d = *impl;
+  // dst is the peer's window, which a read reads from
+  auto& d = *this;
   if (posted) {
     *posted = false;
   }
-  if (!d.stage) {
+  if (!d.stage || (reading && !d.reads)) {
     return -EOPNOTSUPP;
   }
   if (dst.provider != d.prov) {
@@ -1947,11 +2024,32 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
   }
   size_t chunks = 0;
   for (const auto& w : writes) {
-    if (w.len > total || w.src_ofs > total - w.len ||
-	w.len > dst.size || w.dst_ofs > dst.size - w.len) {
+    if (w.len > total || w.local > total - w.len ||
+	w.len > dst.size || w.remote > dst.size - w.len) {
       return -ERANGE;
     }
     chunks += (w.len + d.max_write - 1) / d.max_write;
+  }
+  if (reading) {
+    // every destination byte must come from a read: the slot still holds
+    // the bytes of an earlier transfer, maybe another client's, and a gap
+    // would scatter those into iov
+    std::vector<std::pair<uint64_t, uint64_t>> tiles;
+    tiles.reserve(writes.size());
+    for (const auto& w : writes) {
+      tiles.emplace_back(w.local, w.len);
+    }
+    std::sort(tiles.begin(), tiles.end());
+    uint64_t next = 0;
+    for (const auto& [ofs, len] : tiles) {
+      if (ofs != next) {
+	return -ERANGE;
+      }
+      next += len;
+    }
+    if (next != total) {
+      return -ERANGE;
+    }
   }
   if (total > d.cfg.stage_size) {
     return -E2BIG;
@@ -2016,15 +2114,16 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
   plan->self = d.plans.begin();
   plan->slot = slot;
   plan->peer = dst.name;
+  plan->reading = reading;
   plan->budget_end = budget_end;
   plan->deadline = deadline;
   plan->ops.reserve(chunks);
 
   // gather the source into the slot without the lock: it can be
-  // megabytes, and the slot is ours alone
+  // megabytes, and the slot is ours alone. A read fills the slot instead.
   char* buf = d.stage + slot * d.cfg.stage_size;
   l.unlock();
-  {
+  if (!reading) {
     char* p = buf;
     for (size_t i = 0; i < iovcnt; i++) {
       std::memcpy(p, iov[i].iov_base, iov[i].iov_len);
@@ -2057,9 +2156,14 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
       auto& op = plan->ops.emplace_back();
       op.plan = plan;
       ssize_t r;
-      while ((r = fi_write(d.ep, buf + w.src_ofs + o, n, d.stage_mr.desc, addr,
-			   dst.base + w.dst_ofs + o, dst.key, &op.ctx)) ==
-	     -FI_EAGAIN) {
+      auto post = [&] {
+	return reading ?
+	  fi_read(d.ep, buf + w.local + o, n, d.stage_mr.desc, addr,
+		  dst.base + w.remote + o, dst.key, &op.ctx) :
+	  fi_write(d.ep, buf + w.local + o, n, d.stage_mr.desc, addr,
+		   dst.base + w.remote + o, dst.key, &op.ctx);
+      };
+      while ((r = post()) == -FI_EAGAIN) {
 	// the transmit queue is full: progress, which completes what
 	// is out, then retry, letting others at the endpoint meanwhile
 	d.poll_locked();
@@ -2077,15 +2181,15 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
 	plan->ops.pop_back();
 	if (!plan->err && !plan->cut) {
 	  d.set_err(d.broken ? std::string("the endpoint is broken") :
-		    "fi_write: " + fi_err(r));
-	  d.writes_failed++;
+		    (reading ? "fi_read: " : "fi_write: ") + fi_err(r));
+	  (reading ? d.reads_failed : d.writes_failed)++;
 	  plan->err = r == -FI_EAGAIN ? -ETIMEDOUT :
 	    d.broken ? -EIO : to_errno(r);
 	}
 	break;
       }
       plan->outstanding++;
-      d.writes_posted++;
+      (reading ? d.reads_posted : d.writes_posted)++;
       if (posted) {
 	*posted = true;
       }
@@ -2138,8 +2242,19 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
     if (plan->outstanding == 0) {
       leave();
       const int res = plan->err;
+      if (!res && reading) {
+	// every read completed: scatter the slot without the lock, as the
+	// gather does; the plan holds the slot until it retires
+	l.unlock();
+	const char* q = buf;
+	for (size_t i = 0; i < iovcnt; i++) {
+	  std::memcpy(iov[i].iov_base, q, iov[i].iov_len);
+	  q += iov[i].iov_len;
+	}
+	l.lock();
+      }
       if (!res) {
-	d.bytes_written += total;
+	(reading ? d.bytes_read : d.bytes_written) += total;
 	const auto took = std::chrono::steady_clock::now() - plan->posted_at;
 	if (total >= RATE_MIN_BYTES && took.count() > 0) {
 	  const double rate = double(total) /
@@ -2197,6 +2312,31 @@ int Endpoint::write(const token_t& dst, const struct iovec* iov,
   }
 }
 
+
+int Endpoint::write(const token_t& dst, const struct iovec* iov,
+		    size_t iovcnt, const std::vector<write_t>& writes,
+		    std::chrono::milliseconds budget, bool* posted)
+{
+  std::vector<Impl::range_t> ranges;
+  ranges.reserve(writes.size());
+  for (const auto& w : writes) {
+    ranges.push_back({w.src_ofs, w.len, w.dst_ofs});
+  }
+  return impl->transfer(false, dst, iov, iovcnt, ranges, budget, posted);
+}
+
+int Endpoint::read(const token_t& src, const struct iovec* iov,
+		   size_t iovcnt, const std::vector<read_t>& reads,
+		   std::chrono::milliseconds budget, bool* posted)
+{
+  std::vector<Impl::range_t> ranges;
+  ranges.reserve(reads.size());
+  for (const auto& r : reads) {
+    ranges.push_back({r.dst_ofs, r.len, r.src_ofs});
+  }
+  return impl->transfer(true, src, iov, iovcnt, ranges, budget, posted);
+}
+
 void Endpoint::progress()
 {
   std::lock_guard l(impl->mtx);
@@ -2233,6 +2373,9 @@ Endpoint::stats_t Endpoint::stats() const
   s.writes_posted = d.writes_posted;
   s.writes_failed = d.writes_failed;
   s.bytes_written = d.bytes_written;
+  s.reads_posted = d.reads_posted;
+  s.reads_failed = d.reads_failed;
+  s.bytes_read = d.bytes_read;
   s.peers_inserted = d.peers_inserted;
   s.staging_busy = d.staging_busy;
   s.timeouts = d.timeouts;

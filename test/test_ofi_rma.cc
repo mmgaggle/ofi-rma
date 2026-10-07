@@ -5,6 +5,7 @@
 
 #include "ofi_rma/ofi_rma.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <cstdlib>
@@ -2276,5 +2277,274 @@ INSTANTIATE_TEST_SUITE_P(
 
 INSTANTIATE_TEST_SUITE_P(
   Providers, OfiWrite,
+  ::testing::ValuesIn(test_providers()),
+  provider_test_name);
+
+namespace {
+
+/// a window owner and a reader, both asking for reads, or nothing when the
+/// provider is not available here
+pair_t open_read_pair(const std::string& prov, const std::string& node,
+		      bool reads = true)
+{
+  config_t c;
+  c.provider = prov;
+  c.node = node;
+  c.reads = reads;
+  config_t tc = c;
+  tc.progress_thread = true;
+  config_t rc = c;
+  rc.stage_size = 4 << 20;
+  rc.stage_count = 2;
+  std::string err;
+  pair_t p;
+  p.target = Endpoint::open(tc, &err);
+  if (p.target) {
+    p.writer = Endpoint::open(rc, &err);
+  }
+  if (!p.target || !p.writer) {
+    std::cerr << prov << ": " << err << std::endl;
+    return {};
+  }
+  return p;
+}
+
+class OfiRead : public ::testing::TestWithParam<std::pair<const char*, const char*>> {};
+
+} // anonymous namespace
+
+TEST_P(OfiRead, PullsRanges)
+{
+  auto [prov, node] = GetParam();
+  auto p = open_read_pair(prov, node);
+  if (!p.target) {
+    GTEST_SKIP() << prov << " is not available";
+  }
+  if (!p.target->reads() || !p.writer->reads()) {
+    GTEST_SKIP() << prov << " offers no RMA reads";
+  }
+  EXPECT_NE(std::string::npos, p.writer->describe().find(", reads"));
+  const size_t N = 3 << 20;
+  std::vector<char> win(N), dst(N, 0);
+  for (size_t i = 0; i < N; i++) {
+    win[i] = static_cast<char>(i * 7 + 3);
+  }
+  Endpoint::window_t w;
+  ASSERT_EQ(0, p.target->register_window(win.data(), N, memory_t{},
+					 Endpoint::remote_read, &w))
+    << p.target->last_error();
+  auto tok = parse_token(p.target->window_token(w, 0, N));
+  ASSERT_TRUE(tok);
+
+  // the window's halves, swapped, into two destination buffers
+  iovec iov[2] = {{dst.data(), N / 3}, {dst.data() + N / 3, N - N / 3}};
+  std::vector<Endpoint::read_t> rs = {{0, N / 2, N / 2}, {N / 2, N / 2, 0}};
+  bool posted = false;
+  ASSERT_EQ(0, p.writer->read(*tok, iov, 2, rs, BUDGET, &posted))
+    << p.writer->last_error();
+  EXPECT_TRUE(posted);
+  EXPECT_EQ(0, memcmp(dst.data(), win.data() + N / 2, N / 2));
+  EXPECT_EQ(0, memcmp(dst.data() + N / 2, win.data(), N / 2));
+
+  // a token for part of the window addresses from that part's start
+  auto sub = parse_token(p.target->window_token(w, 4096, 8192));
+  ASSERT_TRUE(sub);
+  std::vector<char> small(8192, 0);
+  iovec one{small.data(), small.size()};
+  ASSERT_EQ(0, p.writer->read(*sub, &one, 1, {{0, 8192, 0}}, BUDGET))
+    << p.writer->last_error();
+  EXPECT_EQ(0, memcmp(small.data(), win.data() + 4096, 8192));
+
+  const auto st = p.writer->stats();
+  EXPECT_EQ(N + 8192, st.bytes_read);
+  EXPECT_GE(st.reads_posted, 3u);
+  EXPECT_EQ(0u, st.reads_failed);
+  EXPECT_EQ(0u, st.bytes_written);
+}
+
+TEST_P(OfiRead, RefusedWithoutReads)
+{
+  auto [prov, node] = GetParam();
+  auto p = open_read_pair(prov, node, false);
+  if (!p.target) {
+    GTEST_SKIP() << prov << " is not available";
+  }
+  EXPECT_FALSE(p.target->reads());
+  EXPECT_FALSE(p.writer->reads());
+  std::vector<char> win(4096), dst(4096);
+  Endpoint::window_t w;
+  EXPECT_EQ(-EOPNOTSUPP, p.target->register_window(
+	      win.data(), win.size(), memory_t{}, Endpoint::remote_read, &w));
+  EXPECT_EQ(-EINVAL, p.target->register_window(win.data(), win.size(),
+					       memory_t{}, 0, &w));
+  ASSERT_EQ(0, p.target->register_window(win.data(), win.size(), &w));
+  auto tok = parse_token(p.target->window_token(w, 0, win.size()));
+  ASSERT_TRUE(tok);
+  iovec iov{dst.data(), dst.size()};
+  bool posted = true;
+  EXPECT_EQ(-EOPNOTSUPP, p.writer->read(*tok, &iov, 1, {{0, 4096, 0}}, BUDGET,
+					&posted));
+  EXPECT_FALSE(posted);
+}
+
+TEST_P(OfiRead, ChecksRanges)
+{
+  auto [prov, node] = GetParam();
+  auto p = open_read_pair(prov, node);
+  if (!p.target) {
+    GTEST_SKIP() << prov << " is not available";
+  }
+  if (!p.target->reads() || !p.writer->reads()) {
+    GTEST_SKIP() << prov << " offers no RMA reads";
+  }
+  const size_t N = 1 << 20;
+  std::vector<char> win(N, 'w'), dst(N, 'd');
+  Endpoint::window_t w;
+  ASSERT_EQ(0, p.target->register_window(win.data(), N, memory_t{},
+					 Endpoint::remote_read, &w));
+  auto tok = parse_token(p.target->window_token(w, 0, N));
+  ASSERT_TRUE(tok);
+  iovec iov{dst.data(), N};
+  // past the window, past the destination
+  EXPECT_EQ(-ERANGE, p.writer->read(*tok, &iov, 1, {{1, N, 0}}, BUDGET));
+  EXPECT_EQ(-ERANGE, p.writer->read(*tok, &iov, 1, {{0, N / 2, N}}, BUDGET));
+  // a gap, an overlap, and a short cover of the destination: a byte not
+  // read would carry an earlier transfer's staging into it
+  EXPECT_EQ(-ERANGE, p.writer->read(*tok, &iov, 1,
+				    {{0, N / 4, 0}, {N / 2, N / 2, N / 2}},
+				    BUDGET));
+  EXPECT_EQ(-ERANGE, p.writer->read(*tok, &iov, 1,
+				    {{0, N / 2, 0}, {0, N / 2, N / 4}},
+				    BUDGET));
+  EXPECT_EQ(-ERANGE, p.writer->read(*tok, &iov, 1, {{0, N / 2, 0}}, BUDGET));
+  EXPECT_EQ(0, std::count(dst.begin(), dst.end(), 'w'));
+  // more than a staging buffer holds
+  std::vector<char> big(8 << 20);
+  std::vector<char> bigwin(8 << 20);
+  Endpoint::window_t bw;
+  ASSERT_EQ(0, p.target->register_window(bigwin.data(), bigwin.size(),
+					 memory_t{}, Endpoint::remote_read, &bw));
+  auto btok = parse_token(p.target->window_token(bw, 0, bigwin.size()));
+  ASSERT_TRUE(btok);
+  iovec biov{big.data(), big.size()};
+  EXPECT_EQ(-E2BIG, p.writer->read(*btok, &biov, 1, {{0, big.size(), 0}},
+				   BUDGET));
+  // another provider's token
+  token_t other = *tok;
+  other.provider = "nonesuch";
+  EXPECT_EQ(-EPROTONOSUPPORT, p.writer->read(other, &iov, 1, {{0, N, 0}},
+					     BUDGET));
+}
+
+TEST_P(OfiRead, WriteOnlyWindowRefusesReads)
+{
+  auto [prov, node] = GetParam();
+  auto p = open_read_pair(prov, node);
+  if (!p.target) {
+    GTEST_SKIP() << prov << " is not available";
+  }
+  if (!p.target->reads() || !p.writer->reads()) {
+    GTEST_SKIP() << prov << " offers no RMA reads";
+  }
+  // a window lent for a GET takes writes; its token must not let a peer
+  // read the memory
+  const size_t N = 64 << 10;
+  std::vector<char> win(N, 's'), dst(N, 'd');
+  Endpoint::window_t w;
+  ASSERT_EQ(0, p.target->register_window(win.data(), N, &w));
+  auto tok = parse_token(p.target->window_token(w, 0, N));
+  ASSERT_TRUE(tok);
+  iovec iov{dst.data(), N};
+  const int r = p.writer->read(*tok, &iov, 1, {{0, N, 0}}, BUDGET);
+  EXPECT_LT(r, 0) << "read a window registered for writes only";
+  EXPECT_EQ(N, size_t(std::count(dst.begin(), dst.end(), 'd')))
+    << "a failed read touched its destination";
+  // the endpoint still reads a window that allows it
+  std::vector<char> rwin(N, 'r');
+  Endpoint::window_t rw;
+  ASSERT_EQ(0, p.target->register_window(rwin.data(), N, memory_t{},
+					 Endpoint::remote_read |
+					 Endpoint::remote_write, &rw));
+  auto rtok = parse_token(p.target->window_token(rw, 0, N));
+  ASSERT_TRUE(rtok);
+  int ok = -1;
+  for (int i = 0; i < 20 && ok != 0; i++) {
+    // a failed RMA can take the provider's connection down for a moment
+    ok = p.writer->read(*rtok, &iov, 1, {{0, N, 0}}, BUDGET);
+    if (ok) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  }
+  ASSERT_EQ(0, ok) << p.writer->last_error();
+  EXPECT_EQ(N, size_t(std::count(dst.begin(), dst.end(), 'r')));
+}
+
+TEST_P(OfiRead, ReadsAndWritesShareTheEndpoint)
+{
+  auto [prov, node] = GetParam();
+  auto p = open_read_pair(prov, node);
+  if (!p.target) {
+    GTEST_SKIP() << prov << " is not available";
+  }
+  if (!p.target->reads() || !p.writer->reads()) {
+    GTEST_SKIP() << prov << " offers no RMA reads";
+  }
+  // one thread pulls one window while another pushes into a second one,
+  // through the same two staging buffers
+  const size_t N = 1 << 20;
+  std::vector<char> src(N), sink(N, 0);
+  for (size_t i = 0; i < N; i++) {
+    src[i] = static_cast<char>(i * 13 + 1);
+  }
+  Endpoint::window_t sw, kw;
+  ASSERT_EQ(0, p.target->register_window(src.data(), N, memory_t{},
+					 Endpoint::remote_read, &sw));
+  ASSERT_EQ(0, p.target->register_window(sink.data(), N, &kw));
+  auto stok = parse_token(p.target->window_token(sw, 0, N));
+  auto ktok = parse_token(p.target->window_token(kw, 0, N));
+  ASSERT_TRUE(stok && ktok);
+  std::atomic<int> read_errs{0}, write_errs{0};
+  std::thread reader([&] {
+    std::vector<char> got(N);
+    for (int i = 0; i < 50; i++) {
+      std::fill(got.begin(), got.end(), 0);
+      iovec iov{got.data(), N};
+      int r;
+      while ((r = p.writer->read(*stok, &iov, 1, {{0, N, 0}}, BUDGET)) ==
+	     -EBUSY) {
+	std::this_thread::yield();
+      }
+      if (r || memcmp(got.data(), src.data(), N)) {
+	read_errs++;
+      }
+    }
+  });
+  std::thread writer([&] {
+    for (int i = 0; i < 50; i++) {
+      std::vector<char> b(N, static_cast<char>(i));
+      iovec iov{b.data(), N};
+      int r;
+      while ((r = p.writer->write(*ktok, &iov, 1, {{0, N, 0}}, BUDGET)) ==
+	     -EBUSY) {
+	std::this_thread::yield();
+      }
+      if (r) {
+	write_errs++;
+      }
+    }
+  });
+  reader.join();
+  writer.join();
+  EXPECT_EQ(0, read_errs.load()) << p.writer->last_error();
+  EXPECT_EQ(0, write_errs.load()) << p.writer->last_error();
+  p.target->sync();
+  EXPECT_EQ(N, size_t(std::count(sink.begin(), sink.end(), char(49))));
+  const auto st = p.writer->stats();
+  EXPECT_EQ(50 * N, st.bytes_read);
+  EXPECT_EQ(50 * N, st.bytes_written);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  Providers, OfiRead,
   ::testing::ValuesIn(test_providers()),
   provider_test_name);

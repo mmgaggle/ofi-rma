@@ -112,6 +112,13 @@ struct config_t {
   /// host windows only: see Endpoint::hmem(). Off by default, since the
   /// question can make a provider choose other attributes.
   bool hmem = false;
+  /// ask the provider for RMA reads (FI_READ and FI_REMOTE_READ): read()
+  /// pulls bytes out of a peer's window, and a window registered with
+  /// Endpoint::remote_read lets peers pull out of it, as an OSD pulls the
+  /// payload of a PUT out of a client's memory. A provider without them is
+  /// still used, for writes only: see Endpoint::reads(). Off by default,
+  /// since the question can make a provider choose other attributes.
+  bool reads = false;
   /// ask for a thread-safe domain (FI_THREAD_SAFE), so that adding a new
   /// peer to the address vector, which can be slow, holds up no other
   /// write. A provider that offers only FI_THREAD_DOMAIN still works:
@@ -249,6 +256,14 @@ public:
   };
   /// the provider offers FI_HMEM: windows may live in device memory
   bool hmem() const;
+  /// the provider offers RMA reads (see config_t::reads): read() works,
+  /// and windows can be registered with remote_read
+  bool reads() const;
+  /// what a peer holding a window's token may do with it
+  enum access_t : unsigned {
+    remote_write = 1,  ///< write into it, as an OSD delivering a GET
+    remote_read = 2,   ///< read out of it, as an OSD pulling a PUT
+  };
   /// register [ptr, ptr+len) of host memory for remote writes
   int register_window(char* ptr, size_t len, window_t* out);
   /// register [ptr, ptr+len) of the memory mem names for remote writes.
@@ -256,6 +271,14 @@ public:
   /// keeps its memory across rekey_window() and cut-offs.
   int register_window(char* ptr, size_t len, const memory_t& mem,
                       window_t* out);
+  /// register a window that peers may access as access says, a mask of
+  /// access_t. remote_read without reads() is refused with -EOPNOTSUPP.
+  /// A token for such a window lets whoever holds it read the window's
+  /// memory, so re-key the window (rekey_window()) once the operation it
+  /// was lent for is over. The window keeps its access across re-keys and
+  /// cut-offs.
+  int register_window(char* ptr, size_t len, const memory_t& mem,
+                      unsigned access, window_t* out);
   void deregister_window(uint64_t id);
   /**
    * Give a window a new memory key before its memory is reused for
@@ -377,6 +400,36 @@ public:
 	    const std::vector<write_t>& writes,
 	    std::chrono::milliseconds budget, bool* posted = nullptr);
 
+  struct read_t {
+    uint64_t src_ofs = 0;  ///< offset in the source window
+    uint64_t len = 0;
+    uint64_t dst_ofs = 0;  ///< offset in the scattered destination bytes
+  };
+  /**
+   * Read each range of the window src names into a staging buffer, and
+   * once every read completed, scatter the staged bytes into iov. Blocks
+   * until then, or until the budget runs out. The window must have been
+   * registered with remote_read; the provider fails the reads of one
+   * that was not, and read() returns its error. The reads' destination
+   * ranges must cover the bytes of iov exactly once (-ERANGE otherwise),
+   * so that no byte of an earlier transfer's staging reaches iov.
+   *
+   * Returns 0 or a negative errno, as write() does, and -EOPNOTSUPP
+   * when the endpoint has no staging or no reads (see reads()). Nothing
+   * is copied into iov unless every read completed: on failure iov is
+   * untouched. A read still in flight when the budget runs out is cut
+   * off as a write is, and can only land in its staging, which no other
+   * transfer uses until the read completes or the endpoint closes.
+   * *posted says whether any read was handed to the provider.
+   *
+   * Reads and writes share the staging buffers, the peers, the budget
+   * rules and the cut-offs described at write(); a cut-off that resets
+   * the endpoint fails the reads and writes in flight alike.
+   */
+  int read(const token_t& src, const struct iovec* iov, size_t iovcnt,
+	   const std::vector<read_t>& reads,
+	   std::chrono::milliseconds budget, bool* posted = nullptr);
+
   /// one pass over the completion queue
   void progress();
   /// order the caller's reads of window memory after writes this
@@ -401,6 +454,9 @@ public:
     uint64_t writes_posted = 0;
     uint64_t writes_failed = 0;
     uint64_t bytes_written = 0;
+    uint64_t reads_posted = 0;
+    uint64_t reads_failed = 0;
+    uint64_t bytes_read = 0;
     uint64_t peers_inserted = 0;
     uint64_t staging_busy = 0;
     uint64_t timeouts = 0;
