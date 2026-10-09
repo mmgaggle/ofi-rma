@@ -47,6 +47,10 @@ If a provider reports a protocol that is not in the table, the wire name is `pro
 
 If the token's wire equals the writer's own wire, version included, the writer accepts the token. Otherwise, the writer refuses it.
 
+The figure below shows the address field of two providers, and a token from each wire. The tokens came from endpoints on one test host, each for a 16 MiB window.
+
+![The address layouts of verbs;ofi_rxm and the UET reference wrapper, and an example token for each wire](token-wires.png)
+
 ### The auth field
 
 The UET packet carries a 24-bit JobID, and the target NIC accepts a write only with a JobID that the region authorizes. The endpoint address does not contain the JobID, so the token must carry it. The JobID grants nothing by itself: the writer's kernel driver allows a process only the JobIDs that the provisioning system assigned to it.

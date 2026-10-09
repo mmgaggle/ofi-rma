@@ -6,6 +6,8 @@ A window owner registers memory and hands out a token that names it. Any writer 
 
 Ceph uses ofi-rma for the out-of-band legs that its OSDs and gateway run. A client of Ceph's S3-over-RDMA data path, such as a NIXL object engine, uses it to lend the memory that the OSDs write into.
 
+![The window owner registers memory and makes a token. A gateway passes the token to an OSD, and the OSD writes into the window or reads out of it.](doc/token-flow.png)
+
 ## Interfaces
 
 - `ofi_rma/ofi_rma.h` is the C interface. Its functions start with `ofi_rma_`, and they return a negative errno on failure.
@@ -29,6 +31,8 @@ This README uses the C++ names. Each one has a C counterpart. For example, `conf
 Every field except the tag and the wire is lowercase hex. The token starts with the same `addr:size` fields as a cuObject descriptor. A server that only forwards tokens can read the window size without parsing the rest. `token_family()` tells an `ofi<N>` token from a cuObject descriptor.
 
 The wire names the protocol, not the provider. Two vendors' UET providers thus take each other's tokens. See `doc/wire-tokens.md` for the reasons, and for the way a server picks one of its endpoints for a token.
+
+![The fields of a token from a verbs;ofi_rxm endpoint, with the meaning and the encoding of each field](doc/token-format.png)
 
 ## Providers
 
