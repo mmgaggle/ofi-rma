@@ -1,33 +1,43 @@
 # ofi-rma
 
-ofi-rma moves data out of band into memory that a peer lends, over libfabric. It depends only on libfabric and the C++17 standard library.
+ofi-rma moves data out of band into memory that a peer lends, over libfabric. The library is written in C11, and it depends only on libfabric and POSIX threads.
 
-A window owner registers memory and hands out a token that names it. Any writer that holds the token and runs the same libfabric provider writes into that memory. The writer needs no connection to the owner, and the owner never adds the writer to its address vector.
+A window owner registers memory and hands out a token that names it. Any writer that holds the token and speaks the same wire protocol writes into that memory. The writer needs no connection to the owner, and the owner never adds the writer to its address vector.
 
 Ceph uses ofi-rma for the out-of-band legs that its OSDs and gateway run. A client of Ceph's S3-over-RDMA data path, such as a NIXL object engine, uses it to lend the memory that the OSDs write into.
+
+## Interfaces
+
+- `ofi_rma/ofi_rma.h` is the C interface. Its functions start with `ofi_rma_`, and they return a negative errno on failure.
+- `ofi_rma/ofi_rma.hpp` is a header-only C++17 wrapper in the namespace `ofi_rma`. A C++ program links with the C library only.
+
+This README uses the C++ names. Each one has a C counterpart. For example, `config_t::hmem` is `ofi_rma_config.hmem`, and `Endpoint::hmem()` is `ofi_rma_ep_hmem()`.
 
 ## Token format
 
 ```
-<base hex>:<size hex>:ofi1:<provider>:<endpoint name hex>:<key hex>
+<base>:<size>:ofi1:<wire>:<address>:<key>[:<auth>]
 ```
 
 - `base` is the remote address of window byte 0, as the owner's provider reads it. That is a virtual address under `FI_MR_VIRT_ADDR` and a region offset otherwise. A writer writes window byte `i` at `base + i`.
 - `size` is the length of the window.
-- `provider` is `fabric_attr->prov_name`, for example `tcp` or `verbs;ofi_rxm`. Both ends must run the same provider.
-- `endpoint name` is the owner's `fi_getname()` bytes, at most 192 bytes.
+- `wire` is the wire protocol and its version, from the provider's `fi_ep_attr`: for example `rxm.1` for `verbs;ofi_rxm`, or `xnet.1` for `tcp`. A writer takes only tokens of its own wire.
+- `address` is the owner's `fi_getname()` bytes, at most 192 bytes.
 - `key` is the region's `fi_mr_key()`. A provider with keys longer than 8 bytes, or with `FI_MR_RAW`, is refused.
+- `auth` is optional: the authorization key that the region is bound to, such as a UET JobID. This version parses it but does not use it yet. A write or read with such a token fails with `-EPROTONOSUPPORT`.
 
-The token starts with the same `addr:size` fields as a cuObject descriptor. A server that only forwards tokens can read the window size without parsing the rest.
+Every field except the tag and the wire is lowercase hex. The token starts with the same `addr:size` fields as a cuObject descriptor. A server that only forwards tokens can read the window size without parsing the rest. `token_family()` tells an `ofi<N>` token from a cuObject descriptor.
+
+The wire names the protocol, not the provider. Two vendors' UET providers thus take each other's tokens. See `doc/wire-tokens.md` for the reasons, and for the way a server picks one of its endpoints for a token.
 
 ## Providers
 
-| Provider | Notes |
-|----------|-------|
-| `tcp` | Needs no special hardware. It cannot cut off a late write, so use it for tests only. |
-| `shm` | Works between processes on one host. |
-| `verbs;ofi_rxm` | RDMA reliable connections on any verbs device. On soft-RoCE, set `FI_UNIVERSE_SIZE=16` in every process. See the notes below. |
-| `uet` | Ultra Ethernet, through a libfabric wrapper for the UEC reference provider. |
+| Provider | Wire | Notes |
+|----------|------|-------|
+| `tcp` | `xnet.1` | Needs no special hardware. It cannot cut off a late write, so use it for tests only. |
+| `shm` | `shm.1` | Works between processes on one host. |
+| `verbs;ofi_rxm` | `rxm.1` | RDMA reliable connections on any verbs device. On soft-RoCE, set `FI_UNIVERSE_SIZE=16` in every process. See the notes below. |
+| `uet` | `uet.1` | Ultra Ethernet, through a libfabric wrapper for the UEC reference provider. |
 
 A provider with manual progress places incoming data only while the owner polls its endpoint. Set `config_t::progress_thread` for an endpoint that lends windows, or poll it with `progress()`.
 
@@ -71,7 +81,7 @@ The GPU tests in `test/test_ofi_rma_hip.cc` run over `shm` on an AMD GPU. If the
 
 ## Build
 
-You need libfabric 1.18 or later, with its headers. The tests also need GoogleTest.
+You need a C11 compiler and libfabric 1.18 or later, with its headers. The tests also need a C++17 compiler and GoogleTest.
 
 To build and test with CMake:
 
@@ -97,7 +107,7 @@ The CMake build has these options:
 | `OFI_RMA_INSTALL` | `ON` | `OFF` |
 | `OFI_RMA_HIP` | `AUTO`: if CMake finds the HIP runtime, build the GPU tests | `AUTO`, with tests off |
 
-The tests run over `tcp` and `shm`. They skip a provider that is not available. A full run takes about 40 seconds. To also run them over `verbs;ofi_rxm`, set `OFI_RMA_TEST_VERBS_NODE` to the IP address of an RDMA device, such as a soft-RoCE device. The tests then set `FI_UNIVERSE_SIZE=16` and `FI_MR_CACHE_MONITOR=disabled` unless they are already set.
+`unittest_ofi_rma_c` builds the C interface as strict C11 and checks tokens, a write, a read and a window pool over `tcp`. The C++ tests run over `tcp` and `shm`. They skip a provider that is not available. A full run takes about 40 seconds. To also run them over `verbs;ofi_rxm`, set `OFI_RMA_TEST_VERBS_NODE` to the IP address of an RDMA device, such as a soft-RoCE device. The tests then set `FI_UNIVERSE_SIZE=16` and `FI_MR_CACHE_MONITOR=disabled` unless they are already set.
 
 ## Use from another project
 
@@ -108,10 +118,10 @@ An installed ofi-rma ships a pkg-config file and a CMake package.
 - CMake, from source: `add_subdirectory(ofi-rma)`, then link `ofi_rma`.
 - meson: `dependency('ofi-rma')`. With a wrap file, the dependency also resolves from a subproject.
 
-Include the header as `#include <ofi_rma/ofi_rma.h>`. The namespace is `ofi_rma`.
+From C, include `<ofi_rma/ofi_rma.h>`. From C++, include `<ofi_rma/ofi_rma.hpp>` and compile as C++17 or later.
 
 ## Origin and license
 
-This code started in Ceph as `src/common/ofi_rma.{h,cc}` and `src/test/common/test_ofi_rma.cc`. The history of those three files came along with them.
+This code started in Ceph as `src/common/ofi_rma.{h,cc}` and `src/test/common/test_ofi_rma.cc`. The history of those three files came along with them. Version 0.3 ported the library from C++ to C. The C++ interface became a wrapper over the C one.
 
 ofi-rma is licensed under the MIT license. See `LICENSE`. In Ceph the code was under the LGPL. When the code left Ceph, the author of every commit relicensed it under MIT.

@@ -3,7 +3,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 IBM Corporation
 // SPDX-License-Identifier: MIT
 
-#include "ofi_rma/ofi_rma.h"
+#include "ofi_rma/ofi_rma.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -33,19 +33,32 @@ TEST(OfiToken, RoundTrip)
   token_t t;
   t.base = 0x7f0012345000;
   t.size = 0xc00000;
-  t.provider = "verbs;ofi_rxm";
+  t.wire = "rxm.1";
   t.name = std::string("\x02\x00\x12\x34\x0a\x00\x00\x01\x00\xff", 10);
   t.key = 0xdeadbeef;
   const auto s = format_token(t);
-  EXPECT_EQ(s, "7f0012345000:c00000:ofi1:verbs;ofi_rxm:020012340a00000100ff:"
+  EXPECT_EQ(s, "7f0012345000:c00000:ofi1:rxm.1:020012340a00000100ff:"
 	    "deadbeef");
   auto p = parse_token(s);
   ASSERT_TRUE(p);
   EXPECT_EQ(p->base, t.base);
   EXPECT_EQ(p->size, t.size);
-  EXPECT_EQ(p->provider, t.provider);
+  EXPECT_EQ(p->wire, t.wire);
   EXPECT_EQ(p->name, t.name);
   EXPECT_EQ(p->key, t.key);
+  EXPECT_TRUE(p->auth.empty());
+  EXPECT_EQ(token_family(s), 1u);
+
+  // a UET token bound to a JobID
+  t.wire = "uet.10000";
+  t.auth = std::string("\x00\xa1\xb2", 3);
+  const auto u = format_token(t);
+  EXPECT_EQ(u, "7f0012345000:c00000:ofi1:uet.10000:020012340a00000100ff:"
+	    "deadbeef:00a1b2");
+  auto q = parse_token(u);
+  ASSERT_TRUE(q);
+  EXPECT_EQ(q->wire, "uet.10000");
+  EXPECT_EQ(q->auth, t.auth);
 }
 
 TEST(OfiToken, Rejects)
@@ -53,21 +66,31 @@ TEST(OfiToken, Rejects)
   // the other transports' descriptors
   EXPECT_FALSE(parse_token("0:100000:uet1:10.88.0.30:1234"));
   EXPECT_FALSE(parse_token("7f0000001000:100000:1234:0:abc:1:fe80::1"));
+  EXPECT_EQ(token_family("7f0000001000:100000:1234:0:abc:1:fe80::1"), 0u);
+  // a version this parser does not know is declined, not misrouted
+  EXPECT_FALSE(parse_token("0:10:ofi2:rxm.1:0200:1"));
+  EXPECT_EQ(token_family("0:10:ofi2:rxm.1:0200:1"), 2u);
   // shape
   EXPECT_FALSE(parse_token(""));
-  EXPECT_FALSE(parse_token("0:10:ofi1:tcp:0200:1:extra"));
-  EXPECT_FALSE(parse_token("0:10:ofi1:tcp:0200"));
-  EXPECT_FALSE(parse_token("0:10:ofi2:tcp:0200:1"));
+  EXPECT_FALSE(parse_token("0:10:ofi1:rxm.1:0200:1:extra"));
+  EXPECT_FALSE(parse_token("0:10:ofi1:rxm.1:0200:1:00:00"));
+  EXPECT_FALSE(parse_token("0:10:ofi1:rxm.1:0200"));
   // fields
-  EXPECT_FALSE(parse_token("0:10:ofi1:tcp:020:1"));      // odd hex
-  EXPECT_FALSE(parse_token("0:10:ofi1:tcp:02zz:1"));     // not hex
-  EXPECT_FALSE(parse_token("0:10:ofi1:tcp::1"));         // no name
-  EXPECT_FALSE(parse_token("0:10:ofi1::0200:1"));        // no provider
-  EXPECT_FALSE(parse_token("0:10:ofi1:t p:0200:1"));     // provider charset
-  EXPECT_FALSE(parse_token("0:10:ofi1:tcp:0200:"));      // no key
-  EXPECT_FALSE(parse_token("12345678901234567:10:ofi1:tcp:0200:1"));
-  EXPECT_FALSE(parse_token("0:10:ofi1:tcp:" + std::string(386, 'a') + ":1"));
-  EXPECT_TRUE(parse_token("0:10:ofi1:tcp:" + std::string(384, 'a') + ":1"));
+  EXPECT_FALSE(parse_token("0:10:ofi1:rxm.1:020:1"));      // odd hex
+  EXPECT_FALSE(parse_token("0:10:ofi1:rxm.1:02zz:1"));     // not hex
+  EXPECT_FALSE(parse_token("0:10:ofi1:rxm.1::1"));         // no name
+  EXPECT_FALSE(parse_token("0:10:ofi1::0200:1"));          // no wire
+  EXPECT_FALSE(parse_token("0:10:ofi1:tcp:0200:1"));       // no version
+  EXPECT_FALSE(parse_token("0:10:ofi1:verbs;ofi_rxm:0200:1"));  // a provider
+  EXPECT_FALSE(parse_token("0:10:ofi1:r m.1:0200:1"));     // wire charset
+  EXPECT_FALSE(parse_token("0:10:ofi1:rxm.1:0200:"));      // no key
+  EXPECT_FALSE(parse_token("0:10:ofi1:rxm.1:0200:1:"));    // empty auth
+  EXPECT_FALSE(parse_token("12345678901234567:10:ofi1:rxm.1:0200:1"));
+  EXPECT_FALSE(parse_token("0:10:ofi1:rxm.1:" + std::string(386, 'a') + ":1"));
+  EXPECT_TRUE(parse_token("0:10:ofi1:rxm.1:" + std::string(384, 'a') + ":1"));
+  EXPECT_TRUE(parse_token("0:10:ofi1:rxm.1:" + std::string(384, 'a') + ":1:" +
+			  std::string(128, 'b')));
+  EXPECT_FALSE(parse_token("0:10:ofi1:rxm.1:0200:1:" + std::string(130, 'b')));
 }
 
 namespace {
@@ -161,7 +184,8 @@ TEST_P(OfiWrite, PlacesRanges)
   ASSERT_EQ(0, p.target->register_window(win.data(), N, &w));
   auto tok = parse_token(p.target->window_token(w, 0, N));
   ASSERT_TRUE(tok);
-  EXPECT_EQ(tok->provider, p.writer->provider());
+  EXPECT_EQ(tok->wire, p.writer->wire());
+  EXPECT_EQ(p.target->wire(), p.writer->wire());
 
   // two source buffers, written to the window with their halves swapped
   iovec iov[2] = {{src.data(), N / 3}, {src.data() + N / 3, N - N / 3}};
@@ -185,10 +209,17 @@ TEST_P(OfiWrite, PlacesRanges)
   std::vector<Endpoint::write_t> past_source = {{N / 3 - 10, 20, 0}};
   EXPECT_EQ(-ERANGE, p.writer->write(*tok, iov, 1, past_source, BUDGET));
 
-  // another provider's token is not ours to serve
+  // another wire's token is not ours to serve
   auto other = *tok;
-  other.provider = "nosuchprov";
+  other.wire = "nosuch.1";
   EXPECT_EQ(-EPROTONOSUPPORT, p.writer->write(other, iov, 1, one, BUDGET));
+  // nor, for now, one bound to an authorization key
+  auto authed = *tok;
+  authed.auth = std::string("\x00\x00\x01", 3);
+  bool posted = true;
+  EXPECT_EQ(-EPROTONOSUPPORT,
+	    p.writer->write(authed, iov, 1, one, BUDGET, &posted));
+  EXPECT_FALSE(posted);
 
   // a source larger than a staging buffer is refused
   std::vector<char> big(5 << 20);
@@ -2429,9 +2460,9 @@ TEST_P(OfiRead, ChecksRanges)
   iovec biov{big.data(), big.size()};
   EXPECT_EQ(-E2BIG, p.writer->read(*btok, &biov, 1, {{0, big.size(), 0}},
 				   BUDGET));
-  // another provider's token
+  // another wire's token
   token_t other = *tok;
-  other.provider = "nonesuch";
+  other.wire = "nonesuch.1";
   EXPECT_EQ(-EPROTONOSUPPORT, p.writer->read(other, &iov, 1, {{0, N, 0}},
 					     BUDGET));
 }

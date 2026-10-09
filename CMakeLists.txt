@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 cmake_minimum_required(VERSION 3.16)
-project(ofi_rma VERSION 0.2.0 LANGUAGES CXX)
+project(ofi_rma VERSION 0.3.0 LANGUAGES C)
 
 # A project that adds this directory (Ceph does, as a submodule) gets a
 # static library and no tests or install rules unless it asks for them.
@@ -14,7 +14,7 @@ endif()
 
 option(OFI_RMA_SHARED "Build a shared library" ${OFI_RMA_TOP_LEVEL})
 option(OFI_RMA_BUILD_TESTS "Build the tests" ${OFI_RMA_TOP_LEVEL})
-option(OFI_RMA_INSTALL "Install the library, header and package files"
+option(OFI_RMA_INSTALL "Install the library, headers and package files"
   ${OFI_RMA_TOP_LEVEL})
 set(OFI_RMA_HIP "AUTO" CACHE STRING
   "Test windows in AMD GPU memory with HIP: ON, OFF or AUTO")
@@ -35,24 +35,33 @@ if(NOT FABRIC_INCLUDE_DIR OR NOT FABRIC_LIBRARY)
   message(FATAL_ERROR "ofi_rma needs libfabric (rdma/fabric.h and libfabric)")
 endif()
 
+set(OFI_RMA_SOURCES
+  src/endpoint.c
+  src/pool.c
+  src/token.c
+  src/util.c)
 if(OFI_RMA_SHARED)
-  add_library(ofi_rma SHARED src/ofi_rma.cc)
+  add_library(ofi_rma SHARED ${OFI_RMA_SOURCES})
   set_target_properties(ofi_rma PROPERTIES
     VERSION ${PROJECT_VERSION}
     SOVERSION ${PROJECT_VERSION_MAJOR})
 else()
-  add_library(ofi_rma STATIC src/ofi_rma.cc)
+  add_library(ofi_rma STATIC ${OFI_RMA_SOURCES})
   set_target_properties(ofi_rma PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 add_library(ofi_rma::ofi_rma ALIAS ofi_rma)
-target_compile_features(ofi_rma PUBLIC cxx_std_17)
+set_target_properties(ofi_rma PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+target_compile_definitions(ofi_rma PRIVATE _GNU_SOURCE)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(ofi_rma PRIVATE -Wall -Wextra)
+endif()
 target_include_directories(ofi_rma
   PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
   PRIVATE
     ${FABRIC_INCLUDE_DIR})
-# the public header does not include libfabric's, so a shared library
+# the public headers do not include libfabric's, so a shared library
 # keeps it private; a static one passes it on for the final link
 if(OFI_RMA_SHARED)
   target_link_libraries(ofi_rma PRIVATE ${FABRIC_LIBRARY}
@@ -63,8 +72,23 @@ endif()
 
 if(OFI_RMA_BUILD_TESTS)
   enable_testing()
+
+  # the C interface on its own, built as strict C11
+  add_executable(unittest_ofi_rma_c test/test_c_api.c)
+  set_target_properties(unittest_ofi_rma_c PROPERTIES
+    C_STANDARD 11 C_EXTENSIONS OFF)
+  if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(unittest_ofi_rma_c PRIVATE
+      -Wall -Wextra -Wpedantic -Werror)
+  endif()
+  target_link_libraries(unittest_ofi_rma_c ofi_rma)
+  add_test(NAME unittest_ofi_rma_c COMMAND unittest_ofi_rma_c)
+
+  # the C++ wrapper, and the behavior of the library through it
+  enable_language(CXX)
   find_package(GTest REQUIRED)
   add_executable(unittest_ofi_rma test/test_ofi_rma.cc)
+  target_compile_features(unittest_ofi_rma PRIVATE cxx_std_17)
   target_link_libraries(unittest_ofi_rma ofi_rma GTest::gtest_main)
   add_test(NAME unittest_ofi_rma COMMAND unittest_ofi_rma)
 
@@ -75,6 +99,7 @@ if(OFI_RMA_BUILD_TESTS)
     find_library(HSA_RUNTIME_LIBRARY hsa-runtime64 HINTS /opt/rocm/lib)
     if(HIP_RUNTIME_INCLUDE_DIR AND HIP_RUNTIME_LIBRARY AND HSA_RUNTIME_LIBRARY)
       add_executable(unittest_ofi_rma_hip test/test_ofi_rma_hip.cc)
+      target_compile_features(unittest_ofi_rma_hip PRIVATE cxx_std_17)
       target_compile_definitions(unittest_ofi_rma_hip PRIVATE
         __HIP_PLATFORM_AMD__)
       target_include_directories(unittest_ofi_rma_hip PRIVATE
@@ -93,7 +118,7 @@ if(OFI_RMA_INSTALL)
   install(TARGETS ofi_rma EXPORT ofi_rmaTargets
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
-  install(FILES include/ofi_rma/ofi_rma.h
+  install(FILES include/ofi_rma/ofi_rma.h include/ofi_rma/ofi_rma.hpp
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ofi_rma)
   install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
   install(EXPORT ofi_rmaTargets NAMESPACE ofi_rma::

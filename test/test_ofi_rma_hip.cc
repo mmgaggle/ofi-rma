@@ -7,7 +7,7 @@
 // provider places the writes with ROCr copies, so these tests need a GPU
 // and ROCm, but no RDMA NIC.
 
-#include "ofi_rma/ofi_rma.h"
+#include "ofi_rma/ofi_rma.hpp"
 
 #include <hip/hip_runtime_api.h>
 #include <hsa/hsa_ext_amd.h>
