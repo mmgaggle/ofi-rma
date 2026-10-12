@@ -83,6 +83,16 @@ The `verbs;ofi_rxm` GPU test also reads out of a dma-buf window in AMD GPU memor
 
 The GPU tests in `test/test_ofi_rma_hip.cc` run over `shm` on an AMD GPU. If there is no GPU, or if libfabric has no ROCr support, they skip. To build libfabric with ROCr support, configure it with `--with-rocr=/usr`, or with the path of your ROCm installation.
 
+## Staging in your own memory
+
+A writer copies each transfer into a registered staging buffer. By default an endpoint allocates `stage_count` buffers of `stage_size` bytes itself. A program that runs several transports, and wants one budget of registered memory for all of them, can lend the endpoint its own memory instead:
+
+- Set `config_t::stage_mem` and `config_t::stage_mem_len`. The endpoint registers that memory once, for its own access.
+- Set `config_t::stage_alloc` and `config_t::stage_free`. Each transfer takes a buffer of at least its size, at most `stage_size` bytes, and gives it back when no operation can touch it any more. After a cut-off, that can be when the endpoint closes.
+- The hooks run with the endpoint's lock held, so they must not call into the endpoint.
+
+Ceph's OSDs use this to stage libfabric and cuObject transfers in one arena.
+
 ## Build
 
 You need a C11 compiler and libfabric 1.18 or later, with its headers. The tests also need a C++17 compiler and GoogleTest.

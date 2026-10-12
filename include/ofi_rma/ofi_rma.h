@@ -38,7 +38,7 @@ extern "C" {
 #endif
 
 #define OFI_RMA_VERSION_MAJOR 0
-#define OFI_RMA_VERSION_MINOR 3
+#define OFI_RMA_VERSION_MINOR 4
 #define OFI_RMA_VERSION(major, minor) (((major) << 16) | (minor))
 
 /** OFI_RMA_VERSION() of the library that is running */
@@ -225,7 +225,9 @@ struct ofi_rma_config {
 	const char *node;        /**< local address to bind; or NULL */
 	const char *service;     /**< local service (port) to bind; or NULL */
 	/** staging for outgoing writes: stage_count buffers of stage_size
-	 * bytes each; 0 for an endpoint that only lends windows */
+	 * bytes each; 0 for an endpoint that only lends windows. With
+	 * stage_mem, stage_size is the largest buffer a transfer can take,
+	 * and stage_count is not used. */
 	size_t stage_size;
 	size_t stage_count;
 	/** poll the completion queue from a thread of our own. Providers
@@ -326,6 +328,24 @@ struct ofi_rma_config {
 	bool per_plan_cutoff;
 	/** callbacks for tests, copied when the endpoint opens; or NULL */
 	const struct ofi_rma_hooks *hooks;
+	/**
+	 * Staging in the caller's memory, so that one arena can serve
+	 * several transports. When stage_mem is set, the endpoint registers
+	 * its stage_mem_len bytes once, for its own access, instead of
+	 * allocating staging buffers itself. Each write or read takes a
+	 * buffer of it from stage_alloc, at most stage_size bytes, and gives
+	 * it back with stage_free once no operation can touch it any more:
+	 * after a cut-off, that can be when the endpoint closes.
+	 * stage_alloc returns 0 and the offset of a buffer of at least len
+	 * bytes, or -EBUSY when none is free. Both are called with the
+	 * endpoint's lock held, so they must not call into the endpoint. The
+	 * memory must stay valid until ofi_rma_ep_close() returns.
+	 */
+	void *stage_mem;
+	size_t stage_mem_len;
+	int (*stage_alloc)(void *ctx, size_t len, uint64_t *offset);
+	void (*stage_free)(void *ctx, uint64_t offset, size_t len);
+	void *stage_ctx;
 };
 
 /** every default, and size */

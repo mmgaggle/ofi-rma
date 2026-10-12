@@ -13,6 +13,7 @@
  */
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -194,6 +195,13 @@ struct config_t {
   std::string service;   ///< local service (port) to bind; optional
   size_t stage_size = 0;
   size_t stage_count = 0;
+  /// staging in the caller's memory: see ofi_rma_config.stage_mem.
+  /// stage_alloc returns 0 and the offset of a buffer of at least len
+  /// bytes, or -EBUSY; both run with the endpoint's lock held
+  void* stage_mem = nullptr;
+  size_t stage_mem_len = 0;
+  std::function<int(size_t len, uint64_t* offset)> stage_alloc;
+  std::function<void(uint64_t offset, size_t len)> stage_free;
   bool progress_thread = false;
   bool hmem = false;
   bool reads = false;
@@ -238,6 +246,8 @@ public:
     hooks->cancel = cfg.cancel_hook;
     hooks->reg = cfg.reg_hook;
     hooks->cutoff_close = cfg.cutoff_close_hook;
+    hooks->stage_alloc = cfg.stage_alloc;
+    hooks->stage_free = cfg.stage_free;
     ofi_rma_hooks h{};
     h.ctx = hooks.get();
     if (hooks->wait) h.wait = &wait_tramp;
@@ -272,6 +282,13 @@ public:
     c.lent_wait_ms = cfg.lent_wait.count();
     c.per_plan_cutoff = cfg.per_plan_cutoff;
     c.hooks = &h;
+    if (cfg.stage_mem) {
+      c.stage_mem = cfg.stage_mem;
+      c.stage_mem_len = cfg.stage_mem_len;
+      c.stage_alloc = cfg.stage_alloc ? &stage_alloc_tramp : nullptr;
+      c.stage_free = cfg.stage_free ? &stage_free_tramp : nullptr;
+      c.stage_ctx = hooks.get();
+    }
     ofi_rma_ep* ep = nullptr;
     char e[1024];
     if (ofi_rma_ep_open(&c, &ep, e, sizeof(e)) != 0) {
@@ -541,7 +558,21 @@ private:
     std::function<int()> cancel;
     std::function<void(const char*, size_t, const memory_t&)> reg;
     std::function<int()> cutoff_close;
+    std::function<int(size_t, uint64_t*)> stage_alloc;
+    std::function<void(uint64_t, size_t)> stage_free;
   };
+  static int stage_alloc_tramp(void* c, size_t len, uint64_t* offset)
+  {
+    auto* h = static_cast<hooks_t*>(c);
+    return h->stage_alloc ? h->stage_alloc(len, offset) : -EBUSY;
+  }
+  static void stage_free_tramp(void* c, uint64_t offset, size_t len)
+  {
+    auto* h = static_cast<hooks_t*>(c);
+    if (h->stage_free) {
+      h->stage_free(offset, len);
+    }
+  }
   static void wait_tramp(void* c, int64_t ns)
   {
     static_cast<hooks_t*>(c)->wait(detail::to_time(ns));

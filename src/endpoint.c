@@ -145,7 +145,10 @@ struct plan {
 	int64_t budget_end;
 	/* when its first write was posted */
 	int64_t posted_at;
-	size_t slot;
+	/* its staging buffer: where it starts in the staging memory, and
+	 * what was asked for */
+	uint64_t stage_off;
+	size_t stage_len;
 	struct peer *peer;
 	/* its operations read from the peer into the slot, rather than
 	 * write the slot to the peer */
@@ -237,8 +240,12 @@ struct ofi_rma_ep {
 	 * tried; once it says it cannot, it is not asked again */
 	_Atomic int rekey_in_place;
 
+	/* the staging memory: the endpoint's own, or the caller's
+	 * (cfg.stage_mem) */
 	char *stage;
+	size_t stage_len;
 	struct region stage_mr;
+	/* which of the endpoint's own buffers are taken */
 	bool *stage_busy;
 
 	pthread_mutex_t peer_mtx;
@@ -1023,9 +1030,43 @@ static bool lock_briefly(struct ofi_rma_ep *d)
 /* completions                                                            */
 /* ---------------------------------------------------------------------- */
 
+/* a staging buffer of at least len bytes: its offset in d->stage, or
+ * -EBUSY when none is free */
+static int stage_get_locked(struct ofi_rma_ep *d, size_t len, uint64_t *off)
+{
+	if (d->cfg.stage_mem) {
+		const int r = d->cfg.stage_alloc(d->cfg.stage_ctx, len, off);
+		if (r < 0)
+			return r;
+		if (*off > d->stage_len || len > d->stage_len - *off) {
+			d->cfg.stage_free(d->cfg.stage_ctx, *off, len);
+			set_err(d, "stage_alloc gave a buffer outside the staging "
+				"memory");
+			return -EINVAL;
+		}
+		return 0;
+	}
+	for (size_t s = 0; s < d->cfg.stage_count; s++) {
+		if (!d->stage_busy[s]) {
+			d->stage_busy[s] = true;
+			*off = s * d->cfg.stage_size;
+			return 0;
+		}
+	}
+	return -EBUSY;
+}
+
+static void stage_put_locked(struct ofi_rma_ep *d, uint64_t off, size_t len)
+{
+	if (d->cfg.stage_mem)
+		d->cfg.stage_free(d->cfg.stage_ctx, off, len);
+	else
+		d->stage_busy[off / d->cfg.stage_size] = false;
+}
+
 static void retire_locked(struct ofi_rma_ep *d, struct plan *p)
 {
-	d->stage_busy[p->slot] = false;
+	stage_put_locked(d, p->stage_off, p->stage_len);
 	put_peer(d, p->peer);
 	plan_unlink(&d->plans, p);
 	plan_free(p);
@@ -1288,7 +1329,7 @@ static int close_ep_locked(struct ofi_rma_ep *d)
 	for (struct plan *p = d->hook_cancelled.head; p; p = p->next) {
 		if (!p->released) {
 			p->released = true;
-			d->stage_busy[p->slot] = false;
+			stage_put_locked(d, p->stage_off, p->stage_len);
 			put_peer(d, p->peer);
 		}
 	}
@@ -1498,8 +1539,8 @@ static void reset_locked(struct ofi_rma_ep *d)
 		if (d->stage) {
 			struct region fresh;
 			const uint64_t acc = FI_WRITE | (d->reads ? FI_READ : 0);
-			if (reg(d, d->stage, d->cfg.stage_size * d->cfg.stage_count,
-				acc, &fresh, NULL) < 0) {
+			if (reg(d, d->stage, d->stage_len, acc, &fresh,
+				NULL) < 0) {
 				atomic_store(&d->broken, true);
 				return;
 			}
@@ -1687,7 +1728,19 @@ static void ep_free(struct ofi_rma_ep *d)
 	}
 	if (d->stage_mr.mr)
 		fi_close(&d->stage_mr.mr->fid);
-	free(d->stage);
+	if (d->cfg.stage_mem) {
+		/* the plans still listed give their buffers back to the
+		 * caller's memory, which outlives the endpoint */
+		for (struct plan *p = d->plans.head; p; p = p->next)
+			d->cfg.stage_free(d->cfg.stage_ctx, p->stage_off,
+					  p->stage_len);
+		for (struct plan *p = d->hook_cancelled.head; p; p = p->next)
+			if (!p->released)
+				d->cfg.stage_free(d->cfg.stage_ctx,
+						  p->stage_off, p->stage_len);
+	} else {
+		free(d->stage);
+	}
 	if (d->cq)
 		fi_close(&d->cq->fid);
 	if (d->av)
@@ -2006,29 +2059,47 @@ int ofi_rma_ep_open(const struct ofi_rma_config *cfg_in,
 		return r;
 	}
 
-	if (d->cfg.stage_size && d->cfg.stage_count) {
-		const size_t total = d->cfg.stage_size * d->cfg.stage_count;
-		void *p = NULL;
-		if (posix_memalign(&p, 4096, total) != 0 || !p) {
-			fmt_into(err, errlen, "cannot allocate %zu staging bytes",
-				 total);
-			ep_free(d);
-			return -ENOMEM;
+	if (d->cfg.stage_mem &&
+	    (!d->cfg.stage_alloc || !d->cfg.stage_free ||
+	     !d->cfg.stage_mem_len || !d->cfg.stage_size)) {
+		fmt_into(err, errlen, "stage_mem needs stage_mem_len, stage_size, "
+			 "stage_alloc and stage_free");
+		ep_free(d);
+		return -EINVAL;
+	}
+	if (d->cfg.stage_mem ||
+	    (d->cfg.stage_size && d->cfg.stage_count)) {
+		if (d->cfg.stage_mem) {
+			d->stage = d->cfg.stage_mem;
+			d->stage_len = d->cfg.stage_mem_len;
+		} else {
+			const size_t total =
+				d->cfg.stage_size * d->cfg.stage_count;
+			void *p = NULL;
+			if (posix_memalign(&p, 4096, total) != 0 || !p) {
+				fmt_into(err, errlen,
+					 "cannot allocate %zu staging bytes",
+					 total);
+				ep_free(d);
+				return -ENOMEM;
+			}
+			d->stage = p;
+			d->stage_len = total;
+			d->stage_busy = calloc(d->cfg.stage_count, sizeof(bool));
 		}
-		d->stage = p;
 		const uint64_t acc = FI_WRITE | (d->reads ? FI_READ : 0);
-		if ((r = reg(d, d->stage, total, acc, &d->stage_mr, NULL))) {
+		if ((r = reg(d, d->stage, d->stage_len, acc, &d->stage_mr,
+			     NULL))) {
 			char e[ERR_MAX];
 			get_err(d, e, sizeof(e));
 			fmt_into(err, errlen, "registering staging: %s", e);
 			ep_free(d);
 			return r;
 		}
-		d->stage_busy = calloc(d->cfg.stage_count, sizeof(bool));
 		const unsigned n = d->thread_safe ?
 			(d->cfg.insert_threads ? d->cfg.insert_threads : 1) : 1;
 		d->insert_thrs = calloc(n, sizeof(pthread_t));
-		if (!d->stage_busy || !d->insert_thrs) {
+		if ((!d->cfg.stage_mem && !d->stage_busy) || !d->insert_thrs) {
 			fmt_into(err, errlen, "out of memory");
 			ep_free(d);
 			return -ENOMEM;
@@ -2478,29 +2549,33 @@ static int transfer(struct ofi_rma_ep *d, bool reading,
 			"sent");
 		return -ETIMEDOUT;
 	}
-	size_t slot = 0;
-	while (slot < d->cfg.stage_count && d->stage_busy[slot])
-		slot++;
-	if (slot == d->cfg.stage_count) {
-		d->staging_busy++;
-		pthread_mutex_unlock(&d->mtx);
-		put_peer(d, peer);
-		return -EBUSY;
-	}
 	struct plan *plan = calloc(1, sizeof(*plan));
 	if (plan)
 		plan->ops = calloc(chunks ? chunks : 1, sizeof(*plan->ops));
 	if (!plan || !plan->ops) {
+		if (plan)
+			free(plan->ops);
 		free(plan);
 		pthread_mutex_unlock(&d->mtx);
 		put_peer(d, peer);
 		return -ENOMEM;
 	}
+	uint64_t stage_off = 0;
+	r = stage_get_locked(d, total, &stage_off);
+	if (r < 0) {
+		if (r == -EBUSY)
+			d->staging_busy++;
+		pthread_mutex_unlock(&d->mtx);
+		free(plan->ops);
+		free(plan);
+		put_peer(d, peer);
+		return r;
+	}
 	/* the plan holds the slot and the peer reference from here on; being
 	 * listed, it also keeps a FI_THREAD_DOMAIN insert from starting */
-	d->stage_busy[slot] = true;
 	plan_link_head(&d->plans, plan);
-	plan->slot = slot;
+	plan->stage_off = stage_off;
+	plan->stage_len = total;
 	plan->peer = peer;
 	plan->reading = reading;
 	plan->budget_end = budget_end;
@@ -2509,7 +2584,7 @@ static int transfer(struct ofi_rma_ep *d, bool reading,
 	/* gather the source into the slot without the lock: it can be
 	 * megabytes, and the slot is ours alone. A read fills the slot
 	 * instead. */
-	char *buf = d->stage + slot * d->cfg.stage_size;
+	char *buf = d->stage + stage_off;
 	pthread_mutex_unlock(&d->mtx);
 	if (!reading) {
 		char *p = buf;

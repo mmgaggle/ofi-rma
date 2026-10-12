@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 project('ofi-rma', 'c',
-  version: '0.3.0',
+  version: '0.4.0',
   license: 'MIT',
   meson_version: '>=0.60.0',
   default_options: ['c_std=gnu11', 'warning_level=2'])

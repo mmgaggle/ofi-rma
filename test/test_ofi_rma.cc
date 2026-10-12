@@ -236,6 +236,117 @@ TEST_P(OfiWrite, PlacesRanges)
   EXPECT_EQ(s.bytes_written, N + N / 3);
 }
 
+namespace {
+
+/// staging memory of the caller's, in two buffers that a test can also
+/// refuse to lend
+struct arena_t {
+  static constexpr size_t BUF = 2 << 20;
+  std::vector<char> mem = std::vector<char>(2 * BUF);
+  bool taken[2] = {false, false};
+  bool refuse = false;
+  int lent = 0;
+  int alloc(size_t len, uint64_t* off) {
+    if (refuse || len > BUF) {
+      return -EBUSY;
+    }
+    for (int i = 0; i < 2; i++) {
+      if (!taken[i]) {
+        taken[i] = true;
+        lent++;
+        *off = i * BUF;
+        return 0;
+      }
+    }
+    return -EBUSY;
+  }
+  void free(uint64_t off, size_t) {
+    taken[off / BUF] = false;
+    lent--;
+  }
+};
+
+} // anonymous namespace
+
+// An endpoint stages in the caller's memory, a buffer of it for each
+// transfer, and gives every buffer back.
+TEST_P(OfiWrite, StagesInCallerMemory)
+{
+  auto [prov, node] = GetParam();
+  arena_t a;
+  config_t tc;
+  tc.provider = prov;
+  tc.node = node;
+  tc.progress_thread = true;
+  tc.reads = true;
+  config_t wc = tc;
+  wc.progress_thread = false;
+  wc.stage_size = arena_t::BUF;
+  wc.stage_mem = a.mem.data();
+  wc.stage_mem_len = a.mem.size();
+  wc.stage_alloc = [&a](size_t len, uint64_t* off) { return a.alloc(len, off); };
+  wc.stage_free = [&a](uint64_t off, size_t len) { a.free(off, len); };
+  std::string err;
+  auto target = Endpoint::open(tc, &err);
+  if (!target) {
+    GTEST_SKIP() << prov << " is not available: " << err;
+  }
+  {
+    auto writer = Endpoint::open(wc, &err);
+    ASSERT_TRUE(writer) << err;
+    const size_t N = 1 << 20;
+    std::vector<char> win(N, 0), src(N);
+    for (size_t i = 0; i < N; i++) {
+      src[i] = static_cast<char>(i * 13 + 5);
+    }
+    Endpoint::window_t w;
+    ASSERT_EQ(0, target->register_window(
+      win.data(), N, memory_t{},
+      Endpoint::remote_write | Endpoint::remote_read, &w));
+    auto tok = parse_token(target->window_token(w, 0, N));
+    ASSERT_TRUE(tok);
+    iovec iov = {src.data(), N};
+    std::vector<Endpoint::write_t> all = {{0, N, 0}};
+    ASSERT_EQ(0, writer->write(*tok, &iov, 1, all, BUDGET))
+      << writer->last_error();
+    target->sync();
+    EXPECT_EQ(0, memcmp(win.data(), src.data(), N));
+    EXPECT_EQ(0, a.lent);
+
+    if (writer->reads()) {
+      std::vector<char> back(N, 0);
+      iovec bv = {back.data(), N};
+      std::vector<Endpoint::read_t> whole = {{0, N, 0}};
+      ASSERT_EQ(0, writer->read(*tok, &bv, 1, whole, BUDGET))
+        << writer->last_error();
+      EXPECT_EQ(0, memcmp(back.data(), src.data(), N));
+      EXPECT_EQ(0, a.lent);
+    }
+
+    // none free: refused with nothing sent, and counted
+    a.refuse = true;
+    bool posted = true;
+    EXPECT_EQ(-EBUSY, writer->write(*tok, &iov, 1, all, BUDGET, &posted));
+    EXPECT_FALSE(posted);
+    EXPECT_EQ(1u, writer->stats().staging_busy);
+    a.refuse = false;
+
+    // larger than stage_size: refused up front
+    std::vector<char> big(arena_t::BUF + 1);
+    iovec bigv = {big.data(), big.size()};
+    std::vector<Endpoint::write_t> bw = {{0, 10, 0}};
+    EXPECT_EQ(-E2BIG, writer->write(*tok, &bigv, 1, bw, BUDGET));
+    EXPECT_EQ(0, a.lent);
+  }
+  EXPECT_EQ(0, a.lent);
+
+  // the caller's memory needs its hooks
+  config_t bad = wc;
+  bad.stage_alloc = nullptr;
+  bad.stage_free = nullptr;
+  EXPECT_FALSE(Endpoint::open(bad, &err));
+}
+
 TEST(OfiHmem, AskingForItStillOpensAProviderWithout)
 {
   // a provider that offers no FI_HMEM is still used, with host windows;
