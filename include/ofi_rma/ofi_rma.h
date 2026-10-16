@@ -550,6 +550,30 @@ int ofi_rma_write(struct ofi_rma_ep *ep, const struct ofi_rma_token *dst,
 		  int64_t budget_ms, bool *posted);
 
 /**
+ * Write each range of a buffer of the caller's staging memory into the
+ * window dst names, without copying it: ofi_rma_write() for a source
+ * that is already in place, such as data read from disk straight into
+ * the buffer. Only for an endpoint that stages in the caller's memory
+ * (stage_mem); -EOPNOTSUPP otherwise. [stage_off, stage_off + len) must
+ * be a buffer of the staging memory that the caller took from its own
+ * stage_alloc; -EFAULT when it is not inside the staging memory. The
+ * ranges' local offsets count from stage_off.
+ *
+ * The buffer becomes the endpoint's, as one it took itself: it calls
+ * stage_free(stage_off, len) exactly once, when it returns an error
+ * before posting, or once no operation can touch the buffer any more,
+ * which after a cut-off can be when the endpoint closes. The caller must
+ * not write the buffer, or give it back, until then. Only -EOPNOTSUPP
+ * and -EFAULT leave the buffer with the caller; every other return,
+ * success or failure, took it. Otherwise it returns as ofi_rma_write()
+ * does.
+ */
+int ofi_rma_write_staged(struct ofi_rma_ep *ep,
+			 const struct ofi_rma_token *dst, uint64_t stage_off,
+			 uint64_t len, const struct ofi_rma_range *ranges,
+			 size_t nranges, int64_t budget_ms, bool *posted);
+
+/**
  * Read each range of the window src names into a staging buffer, and
  * once every read completed, scatter the staged bytes into iov. Blocks
  * until then, or until the budget runs out. The window must have been
@@ -665,6 +689,10 @@ struct ofi_rma_stats {
 	/** takes no more writes: unsafe, or a cut-off could not reopen it */
 	bool broken;
 	uint64_t windows;
+	/** ofi_rma_write_staged() calls that posted their writes, and the
+	 * bytes they wrote with no copy into staging */
+	uint64_t staged_writes;
+	uint64_t staged_bytes;
 };
 
 /** fill the first s->size bytes of *s */

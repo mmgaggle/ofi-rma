@@ -343,6 +343,8 @@ struct ofi_rma_ep {
 	/* when the completion queue was last polled */
 	int64_t last_poll;
 	_Atomic uint64_t late_starts;
+	_Atomic uint64_t staged_writes;
+	_Atomic uint64_t staged_bytes;
 	/* how fast plans of RATE_MIN_BYTES or more complete, from the first
 	 * post to the last completion, in bytes per nanosecond, averaged; 0
 	 * until one has */
@@ -2445,13 +2447,23 @@ static void call_wait_hook(struct ofi_rma_ep *d, struct plan *plan)
 	}
 }
 
+/* a caller's buffer of the staging memory that a staged write posts
+ * from: transfer() sets taken once a plan holds it, and from then on
+ * the plan gives it back */
+struct staged {
+	uint64_t off;
+	bool taken;
+};
+
 /* write and read: gather iov into a staging slot and write it to the
  * peer's window, or read the peer's window into the slot and scatter it
- * into iov */
+ * into iov. A staged write (st) posts from the caller's buffer, which iov
+ * names, instead of a slot of its own. */
 static int transfer(struct ofi_rma_ep *d, bool reading,
 		    const struct ofi_rma_token *dst, const struct iovec *iov,
 		    size_t iovcnt, const struct ofi_rma_range *ranges,
-		    size_t nranges, int64_t budget_ms, bool *posted)
+		    size_t nranges, int64_t budget_ms, bool *posted,
+		    struct staged *st)
 {
 	/* dst is the peer's window, which a read reads from */
 	if (posted)
@@ -2561,7 +2573,13 @@ static int transfer(struct ofi_rma_ep *d, bool reading,
 		return -ENOMEM;
 	}
 	uint64_t stage_off = 0;
-	r = stage_get_locked(d, total, &stage_off);
+	if (st) {
+		stage_off = st->off;
+		st->taken = true;
+		r = 0;
+	} else {
+		r = stage_get_locked(d, total, &stage_off);
+	}
 	if (r < 0) {
 		if (r == -EBUSY)
 			d->staging_busy++;
@@ -2586,7 +2604,7 @@ static int transfer(struct ofi_rma_ep *d, bool reading,
 	 * instead. */
 	char *buf = d->stage + stage_off;
 	pthread_mutex_unlock(&d->mtx);
-	if (!reading) {
+	if (!reading && !st) {
 		char *p = buf;
 		for (size_t i = 0; i < iovcnt; i++) {
 			memcpy(p, iov[i].iov_base, iov[i].iov_len);
@@ -2735,6 +2753,10 @@ static int transfer(struct ofi_rma_ep *d, bool reading,
 					d->bytes_read += total;
 				else
 					d->bytes_written += total;
+				if (st) {
+					d->staged_writes++;
+					d->staged_bytes += total;
+				}
 				const int64_t took = now_ns() - plan->posted_at;
 				if (total >= RATE_MIN_BYTES && took > 0) {
 					const double rate = (double)total / (double)took;
@@ -2801,7 +2823,35 @@ int ofi_rma_write(struct ofi_rma_ep *ep, const struct ofi_rma_token *dst,
 		  int64_t budget_ms, bool *posted)
 {
 	return transfer(ep, false, dst, iov, iovcnt, ranges, nranges,
-			budget_ms, posted);
+			budget_ms, posted, NULL);
+}
+
+int ofi_rma_write_staged(struct ofi_rma_ep *ep,
+			 const struct ofi_rma_token *dst, uint64_t stage_off,
+			 uint64_t len, const struct ofi_rma_range *ranges,
+			 size_t nranges, int64_t budget_ms, bool *posted)
+{
+	if (posted)
+		*posted = false;
+	if (!ep->cfg.stage_mem)
+		return -EOPNOTSUPP;
+	if (stage_off > ep->stage_len || len > ep->stage_len - stage_off) {
+		set_err(ep, "a staged write names a buffer outside the staging "
+			"memory; nothing sent");
+		return -EFAULT;
+	}
+	struct staged st = {stage_off, false};
+	struct iovec iov = {ep->stage + stage_off, (size_t)len};
+	const int r = transfer(ep, false, dst, &iov, 1, ranges, nranges,
+			       budget_ms, posted, &st);
+	if (!st.taken) {
+		/* refused before a plan held it: the buffer is ours to give
+		 * back, as the call promises */
+		pthread_mutex_lock(&ep->mtx);
+		ep->cfg.stage_free(ep->cfg.stage_ctx, stage_off, (size_t)len);
+		pthread_mutex_unlock(&ep->mtx);
+	}
+	return r;
 }
 
 int ofi_rma_read(struct ofi_rma_ep *ep, const struct ofi_rma_token *src,
@@ -2810,7 +2860,7 @@ int ofi_rma_read(struct ofi_rma_ep *ep, const struct ofi_rma_token *src,
 		 int64_t budget_ms, bool *posted)
 {
 	return transfer(ep, true, src, iov, iovcnt, ranges, nranges, budget_ms,
-			posted);
+			posted, NULL);
 }
 
 void ofi_rma_ep_progress(struct ofi_rma_ep *ep)
@@ -2891,6 +2941,8 @@ void ofi_rma_ep_get_stats(struct ofi_rma_ep *d, struct ofi_rma_stats *out)
 	s.unsafe = d->unsafe;
 	s.broken = d->broken;
 	s.windows = d->nwindows;
+	s.staged_writes = d->staged_writes;
+	s.staged_bytes = d->staged_bytes;
 	const size_t size = out->size;
 	const size_t n = size < sizeof(s) ? size : sizeof(s);
 	memcpy(out, &s, n);

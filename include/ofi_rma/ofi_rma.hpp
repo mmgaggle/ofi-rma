@@ -408,6 +408,29 @@ public:
                          budget.count(), posted);
   }
 
+  /// see ofi_rma_write_staged(): the writes' src_ofs count from stage_off.
+  /// A token that does not convert is refused with -EFAULT, which leaves
+  /// the buffer with the caller, as the C call's own -EFAULT does.
+  int write_staged(const token_t& dst, uint64_t stage_off, uint64_t len,
+                   const std::vector<write_t>& writes,
+                   std::chrono::milliseconds budget, bool* posted = nullptr)
+  {
+    if (posted) {
+      *posted = false;
+    }
+    ofi_rma_token t;
+    if (!detail::to_c(dst, &t)) {
+      return -EFAULT;
+    }
+    std::vector<ofi_rma_range> r;
+    r.reserve(writes.size());
+    for (const auto& w : writes) {
+      r.push_back(ofi_rma_range{w.src_ofs, w.len, w.dst_ofs});
+    }
+    return ofi_rma_write_staged(ep_, &t, stage_off, len, r.data(), r.size(),
+                                budget.count(), posted);
+  }
+
   struct read_t {
     uint64_t src_ofs = 0;  ///< offset in the source window
     uint64_t len = 0;
@@ -487,6 +510,8 @@ public:
     bool unsafe = false;
     bool broken = false;
     uint64_t windows = 0;
+    uint64_t staged_writes = 0;
+    uint64_t staged_bytes = 0;
   };
   stats_t stats() const
   {
@@ -535,6 +560,8 @@ public:
     s.unsafe = c.unsafe;
     s.broken = c.broken;
     s.windows = c.windows;
+    s.staged_writes = c.staged_writes;
+    s.staged_bytes = c.staged_bytes;
     return s;
   }
   /// the provider's text for the most recent failure

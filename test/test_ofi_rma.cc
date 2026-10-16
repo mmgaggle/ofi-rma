@@ -347,6 +347,91 @@ TEST_P(OfiWrite, StagesInCallerMemory)
   EXPECT_FALSE(Endpoint::open(bad, &err));
 }
 
+// A staged write posts from a buffer the caller filled in its own staging
+// memory, without a copy, and gives the buffer back exactly once: when its
+// writes are done, or when it fails after taking it. Only -EOPNOTSUPP and
+// -EFAULT leave the buffer with the caller.
+TEST_P(OfiWrite, WritesFromCallerStagingWithoutACopy)
+{
+  auto [prov, node] = GetParam();
+  arena_t a;
+  config_t tc;
+  tc.provider = prov;
+  tc.node = node;
+  tc.progress_thread = true;
+  config_t wc = tc;
+  wc.progress_thread = false;
+  wc.stage_size = arena_t::BUF;
+  wc.stage_mem = a.mem.data();
+  wc.stage_mem_len = a.mem.size();
+  wc.stage_alloc = [&a](size_t len, uint64_t* off) { return a.alloc(len, off); };
+  wc.stage_free = [&a](uint64_t off, size_t len) { a.free(off, len); };
+  std::string err;
+  auto target = Endpoint::open(tc, &err);
+  if (!target) {
+    GTEST_SKIP() << prov << " is not available: " << err;
+  }
+  const size_t N = 1 << 20;
+  std::vector<char> win(N, 0);
+  Endpoint::window_t w;
+  ASSERT_EQ(0, target->register_window(win.data(), N, memory_t{},
+                                       Endpoint::remote_write, &w));
+  auto tok = parse_token(target->window_token(w, 0, N));
+  ASSERT_TRUE(tok);
+  {
+    auto writer = Endpoint::open(wc, &err);
+    ASSERT_TRUE(writer) << err;
+
+    // the caller takes a buffer and fills it in place
+    uint64_t off = 0;
+    ASSERT_EQ(0, a.alloc(N, &off));
+    char* buf = a.mem.data() + off;
+    for (size_t i = 0; i < N; i++) {
+      buf[i] = static_cast<char>(i * 7 + 3);
+    }
+    // two ranges, the second from the middle of the buffer
+    std::vector<Endpoint::write_t> two = {{0, N / 2, N / 2}, {N / 2, N / 2, 0}};
+    bool posted = false;
+    ASSERT_EQ(0, writer->write_staged(*tok, off, N, two, BUDGET, &posted))
+      << writer->last_error();
+    EXPECT_TRUE(posted);
+    target->sync();
+    EXPECT_EQ(0, memcmp(win.data(), buf + N / 2, N / 2));
+    EXPECT_EQ(0, memcmp(win.data() + N / 2, buf, N / 2));
+    EXPECT_EQ(0, a.lent);  // given back once its writes were done
+    auto s = writer->stats();
+    EXPECT_EQ(1u, s.staged_writes);
+    EXPECT_EQ(N, s.staged_bytes);
+    EXPECT_EQ(N, s.bytes_written);
+
+    // outside the staging memory: refused, the buffer stays the caller's
+    std::vector<Endpoint::write_t> one = {{0, 10, 0}};
+    EXPECT_EQ(-EFAULT, writer->write_staged(*tok, a.mem.size(), 10, one,
+                                            BUDGET));
+    EXPECT_EQ(0, a.lent);
+
+    // a range past the buffer fails after taking it: given back anyway
+    ASSERT_EQ(0, a.alloc(N, &off));
+    EXPECT_EQ(1, a.lent);
+    std::vector<Endpoint::write_t> past = {{N - 10, 20, 0}};
+    posted = true;
+    EXPECT_EQ(-ERANGE, writer->write_staged(*tok, off, N, past, BUDGET,
+                                            &posted));
+    EXPECT_FALSE(posted);
+    EXPECT_EQ(0, a.lent);
+    EXPECT_EQ(1u, writer->stats().staged_writes);
+  }
+  EXPECT_EQ(0, a.lent);
+
+  // an endpoint with staging of its own refuses, and takes nothing
+  config_t own = tc;
+  own.progress_thread = false;
+  auto plain = Endpoint::open(own, &err);
+  ASSERT_TRUE(plain) << err;
+  std::vector<Endpoint::write_t> one = {{0, 10, 0}};
+  EXPECT_EQ(-EOPNOTSUPP, plain->write_staged(*tok, 0, 10, one, BUDGET));
+}
+
 TEST(OfiHmem, AskingForItStillOpensAProviderWithout)
 {
   // a provider that offers no FI_HMEM is still used, with host windows;
