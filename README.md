@@ -124,8 +124,6 @@ An installed ofi-rma ships a pkg-config file and a CMake package.
 
 From C, include `<ofi_rma/ofi_rma.h>`. From C++, include `<ofi_rma/ofi_rma.hpp>` and compile as C++17 or later.
 
-## Origin and license
+## License
 
-This code started in Ceph as `src/common/ofi_rma.{h,cc}` and `src/test/common/test_ofi_rma.cc`. The history of those three files came along with them. Version 0.3 ported the library from C++ to C. The C++ interface became a wrapper over the C one.
-
-ofi-rma is licensed under the MIT license. See `LICENSE`. In Ceph the code was under the LGPL. When the code left Ceph, the author of every commit relicensed it under MIT.
+ofi-rma is licensed under the MIT license. See `LICENSE`.
