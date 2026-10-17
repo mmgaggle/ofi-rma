@@ -23,6 +23,7 @@
 #include <vector>
 
 #include <sys/resource.h>
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 
@@ -2775,3 +2776,37 @@ INSTANTIATE_TEST_SUITE_P(
   Providers, OfiRead,
   ::testing::ValuesIn(test_providers()),
   provider_test_name);
+
+/// An endpoint whose fi_enable() fails closes without calling into the
+/// provider through it: ofi_rxm progresses its endpoint when its
+/// completion queue is read, and crashed on one that it never enabled.
+/// rxm sizes its verbs completion queue from FI_UNIVERSE_SIZE, so a
+/// universe larger than any device's queue makes the enable fail. Run in
+/// a new process, as libfabric reads the variable once.
+TEST(OfiVerbs, FailedEnableClosesCleanly)
+{
+  const char* node = getenv("OFI_RMA_TEST_VERBS_NODE");
+  if (!node || !*node) {
+    GTEST_SKIP() << "needs OFI_RMA_TEST_VERBS_NODE";
+  }
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_EXIT(
+    {
+      setenv("FI_UNIVERSE_SIZE", "1000000", 1);
+      struct ofi_rma_config cfg;
+      ofi_rma_config_init(&cfg);
+      cfg.provider = "verbs;ofi_rxm";
+      cfg.node = node;
+      struct ofi_rma_ep* ep = nullptr;
+      char err[256] = "";
+      const int r = ofi_rma_ep_open(&cfg, &ep, err, sizeof(err));
+      if (r == 0) {
+        ofi_rma_ep_close(ep);
+        std::cerr << "the endpoint opened" << std::endl;
+        _exit(2);
+      }
+      std::cerr << "open: " << err << std::endl;
+      _exit(0);
+    },
+    ::testing::ExitedWithCode(0), "open: ");
+}

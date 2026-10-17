@@ -319,6 +319,9 @@ struct ofi_rma_ep {
 	_Atomic bool unsafe;
 	/* the endpoint did not close in a cut-off, and is still open */
 	bool zombie;
+	/* fi_enable() succeeded on the endpoint that ep is now: a provider
+	 * may be polled only through an endpoint that it enabled */
+	bool ep_enabled;
 	_Atomic uint64_t resets;
 	_Atomic uint64_t cutoffs_failed;
 	_Atomic uint64_t cutoffs_late;
@@ -1113,7 +1116,11 @@ static size_t poll_locked(struct ofi_rma_ep *d)
 	}
 	d->last_poll = now;
 	size_t got = 0;
-	if (!d->cq || d->zombie)
+	/* not through an endpoint that the provider did not enable: ofi_rxm
+	 * progresses its endpoint when the queue is read, and one whose
+	 * fi_enable() failed crashes it (open_ep() failed at the start, or
+	 * reopening after a cut-off) */
+	if (!d->cq || d->zombie || !d->ep_enabled)
 		return got;
 	struct fi_cq_entry ent[16];
 	for (int round = 0; round < 8; round++) {
@@ -1215,6 +1222,7 @@ static int open_ep(struct ofi_rma_ep *d, char *err, size_t errlen)
 	/* a completion queue with a file descriptor to wait on, if the
 	 * provider has one, so that a waiting write need not poll */
 	d->cq_fd = -1;
+	d->ep_enabled = false;
 	cq_attr.wait_obj = FI_WAIT_FD;
 	int r = fi_cq_open(d->domain, &cq_attr, &d->cq, NULL);
 	if (!r && (fi_control(&d->cq->fid, FI_GETWAIT, &d->cq_fd) ||
@@ -1239,9 +1247,19 @@ static int open_ep(struct ofi_rma_ep *d, char *err, size_t errlen)
 	if ((r = fi_ep_bind(d->ep, &d->av->fid, 0)) ||
 	    (r = fi_ep_bind(d->ep, &d->cq->fid, FI_TRANSMIT | FI_RECV)) ||
 	    (r = fi_enable(d->ep))) {
-		fmt_into(err, errlen, "enabling the endpoint: %s", fi_err(r));
+		/* ofi_rxm sizes the completion queue of its verbs endpoints
+		 * from FI_UNIVERSE_SIZE (256 by default), which can be larger
+		 * than the device allows */
+		const char *prov = d->info->fabric_attr ?
+			d->info->fabric_attr->prov_name : NULL;
+		const bool rxm = prov && strstr(prov, "ofi_rxm");
+		fmt_into(err, errlen, "enabling the endpoint: %s%s", fi_err(r),
+			 rxm ? " (a device with small completion queues, such "
+			       "as soft-RoCE, needs a smaller FI_UNIVERSE_SIZE, "
+			       "such as 64)" : "");
 		return to_errno(r);
 	}
+	d->ep_enabled = true;
 	size_t len = 0;
 	r = fi_getname(&d->ep->fid, NULL, &len);
 	if (r != -FI_ETOOSMALL || len == 0 || len > OFI_RMA_ADDR_MAX) {
@@ -1307,6 +1325,7 @@ static int close_ep_locked(struct ofi_rma_ep *d)
 			return r;
 		}
 		d->ep = NULL;
+		d->ep_enabled = false;
 	}
 	if (d->cq) {
 		const int r = fi_close(&d->cq->fid);
